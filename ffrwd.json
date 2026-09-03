@@ -1,0 +1,53 @@
+{
+  "name": "ffrwd/describe",
+  "version": "0.1.0",
+  "description": "(draft) Four describers over a file, hosted in wasm: clips takes X-CLIP's video tower one shot at a time to a 512-d vector, sounds runs AST over 10s audio windows to AudioSet labels as text rows, embed and embed_text put X-CLIP's text tower under those rows and under a search prompt so cos_similarity can rank one against the other. Speech comes from ffrwd/whisper and ffrwd/vad rather than a describer of its own.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
+  "capabilities": [],
+  "dependencies": {
+    "ffrwd/wasm": "0.14.0",
+    "ffrwd/whisper": "0.1.0"
+  },
+  "keywords": [
+    "describe",
+    "clip",
+    "xclip",
+    "ast",
+    "audioset",
+    "embedding",
+    "vector",
+    "search",
+    "nn"
+  ],
+  "lib": {
+    "clips": "src/clips.sql",
+    "sounds": "src/sounds.sql",
+    "embed": "src/embed.sql",
+    "embed_text": "src/embed.sql"
+  },
+  "bin": {
+    "describe": "recipes/describe.sql",
+    "find": "recipes/find.sql"
+  },
+  "models": {
+    "clips": {
+      "repo": "imbcmdth/xclip-onnx",
+      "revision": "649f3c91b59cd24be316dc505e26eacf5cd00801",
+      "file": "video_tower.onnx",
+      "sha256": "87a87b51ae52efa549e6e48f3a3b41f4fe0e5b91e154afcda5d9ac8dd1b975b4"
+    },
+    "embed": {
+      "repo": "imbcmdth/xclip-onnx",
+      "revision": "649f3c91b59cd24be316dc505e26eacf5cd00801",
+      "file": "text_tower.onnx",
+      "sha256": "c14df0fdda1ba530330e278b8fabeb0bfd9a58c8caa10dfdee38b6ea197d0afc"
+    },
+    "sounds": {
+      "repo": "onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX",
+      "revision": "2fe67046c486b8b8bc90a7b469239b2dec822f72",
+      "file": "onnx/model.onnx",
+      "sha256": "249b57721b7752442ec10dc3ace6f7dcd3ff0460d2c98a8709925ce5b72b69e0"
+    }
+  }
+}

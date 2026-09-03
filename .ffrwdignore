@@ -1,0 +1,10 @@
+# Build output. The files the lib SQL names are pulled back in by the
+# manifest's closure; the rest of the directory stays out of the archive.
+target/
+build/
+
+# The wit the modules' build.rs copies in, once there is a build.rs.
+wit/
+
+# Local development state, not package content.
+ffrwd.lock
