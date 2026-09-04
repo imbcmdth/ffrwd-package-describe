@@ -2,3 +2,5 @@ target/
 build/
 wit/
 ffrwd.lock.bak
+ffrwd.links
+ffrwd.lock
