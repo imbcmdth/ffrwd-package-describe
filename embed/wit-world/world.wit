@@ -1,0 +1,18 @@
+package ffrwd:embed;
+
+/// X-CLIP's text tower, reached two ways: `embed-text` as a value function,
+/// one prompt in and one 512-d vector out, and `embed` as a rows module,
+/// running the same tower over a cue row's `text` field. It exports both
+/// interfaces, the way `ffrwd:fauxlate` does, and additionally imports
+/// `wasi:nn` - the standard interface, not anything of ours - since both
+/// exports run the same graph. It imports no filesystem: the graph file is
+/// the host's, and this module only knows the name it was bound to.
+world embed {
+  export ffrwd:av/values@0.14.0;
+  export ffrwd:av/rows-module@0.14.0;
+
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+}

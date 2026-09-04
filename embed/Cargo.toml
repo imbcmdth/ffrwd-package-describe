@@ -1,0 +1,17 @@
+[package]
+name = "embed"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "embed"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# default-features off drops onig (needs a C compiler) in favour of
+# fancy-regex, and getrandom/wasm_js: both are what make this crate build
+# for wasm32-wasip2 at all.
+tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm"] }
