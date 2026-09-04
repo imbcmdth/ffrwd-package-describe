@@ -1,0 +1,14 @@
+[workspace]
+# The wasm module this crate builds. It builds into
+# target/wasm32-wasip2/release/, which is where src/embed.sql names it.
+members = [
+    "clips",
+    "embed",
+    "sounds",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
