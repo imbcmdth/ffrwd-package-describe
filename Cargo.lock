@@ -220,6 +220,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed_clip"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -45,6 +45,14 @@
 //! gives no timing finer than the window itself, so `start_t`/`end_t` are
 //! the window's own span, in seconds from the start of the stream. `top`
 //! labels are kept out of however many clear `threshold`, ranked by score.
+//!
+//! A window whose label set is exactly the window before's emits no rows:
+//! consecutive windows overlap by half, so a sound that hasn't changed says
+//! the same thing twice for free, and a caller reading these rows back
+//! would otherwise see one label repeated across every window it spans.
+//! The comparison ignores rank order - the same labels in a different order
+//! still count as the same set - and does not affect the audio passed
+//! through, only which rows ride beside it.
 
 // `generate_all`: the world's interfaces come from two other packages -
 // ffrwd:av and wasi:nn - and without it bindgen expects them to have been
@@ -195,15 +203,13 @@ fn ticks_of_samples(sample_count: usize, num: i32, den: i32) -> i64 {
 }
 
 /// One window through the graph: its AudioSet labels at or above
-/// `threshold`, the highest-scoring `top` of them, each a cue row spanning
-/// `[start_s, start_s + samples.len() / SAMPLE_RATE)`.
+/// `threshold`, the highest-scoring `top` of them, ranked score first.
 fn classify(
     context: &GraphExecutionContext,
     samples: &[f32],
-    start_s: f64,
     threshold: f64,
     top: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<&'static str>, String> {
     if fbank::num_frames(samples.len()) == 0 {
         // Not even one 25 ms frame: nothing here but padding, and the model
         // has nothing worth guessing at.
@@ -234,12 +240,30 @@ fn classify(
         ));
     }
 
-    let end_s = start_s + samples.len() as f64 / f64::from(fbank::SAMPLE_RATE);
     Ok(labels::top_labels(&logits, threshold, top)
         .into_iter()
         .filter_map(|(index, _score)| labels::label(index))
-        .map(|name| row(name, start_s, end_s))
         .collect())
+}
+
+/// `current`, sorted, so two labels sets compare equal regardless of the
+/// order the model ranked them in.
+fn label_set(current: &[&str]) -> Vec<String> {
+    let mut set: Vec<String> = current.iter().map(|s| s.to_string()).collect();
+    set.sort_unstable();
+    set
+}
+
+/// True when `current`'s label set is the same as `previous`'s - the
+/// window's own emitted rows are then skipped, since an overlapping window
+/// repeating the same labels (half the window is shared audio) says
+/// nothing an earlier row didn't already. `previous` is `None` before the
+/// first window, which is never a repeat.
+fn is_repeat(previous: &Option<Vec<String>>, current: &[&str]) -> bool {
+    match previous {
+        Some(prev) => *prev == label_set(current),
+        None => false,
+    }
 }
 
 /// What `init` settled, plus the graph it loaded.
@@ -257,6 +281,10 @@ struct Opened {
     /// downstream, so an overlapping window's shared portion is not sent
     /// twice. `None` before the first call.
     emitted_through: Option<f64>,
+    /// The previous window's label set, sorted - `None` before the first
+    /// window that found any frame to classify. A window whose own set
+    /// matches this one emits no rows; see `is_repeat`.
+    previous_labels: Option<Vec<String>>,
 }
 
 thread_local! {
@@ -342,6 +370,7 @@ impl Guest for Sounds {
                 threshold: parsed.threshold,
                 top: parsed.top,
                 emitted_through: None,
+                previous_labels: None,
             });
         });
         Ok(())
@@ -370,6 +399,7 @@ impl Guest for Sounds {
                 threshold,
                 top,
                 emitted_through,
+                previous_labels,
                 ..
             } = opened;
 
@@ -383,8 +413,22 @@ impl Guest for Sounds {
                 let rows = if count == 0 {
                     Vec::new()
                 } else {
-                    classify(context, &samples, start_s, *threshold, *top)
-                        .unwrap_or_else(|message| panic!("{message}"))
+                    let found = classify(context, &samples, *threshold, *top)
+                        .unwrap_or_else(|message| panic!("{message}"));
+                    let rows = if is_repeat(previous_labels, &found) {
+                        // Same labels as the window before: half this
+                        // window's audio is the same audio, so nothing here
+                        // is new information.
+                        Vec::new()
+                    } else {
+                        let end_s = start_s + count as f64 / f64::from(fbank::SAMPLE_RATE);
+                        found
+                            .iter()
+                            .map(|&name| row(name, start_s, end_s))
+                            .collect()
+                    };
+                    *previous_labels = Some(label_set(&found));
+                    rows
                 };
 
                 // How much of this window's front overlaps a window already
@@ -459,6 +503,33 @@ mod tests {
     #[test]
     fn a_parameter_this_module_does_not_have_is_refused() {
         assert!(parse_params(r#"{"treshold":0.5}"#).is_err());
+    }
+
+    #[test]
+    fn label_set_ignores_rank_order() {
+        assert_eq!(
+            label_set(&["Speech", "Music"]),
+            label_set(&["Music", "Speech"])
+        );
+    }
+
+    #[test]
+    fn is_repeat_is_false_before_the_first_window() {
+        assert!(!is_repeat(&None, &["Speech"]));
+    }
+
+    #[test]
+    fn is_repeat_is_true_for_the_same_set_in_a_different_order() {
+        let previous = Some(label_set(&["Speech", "Music"]));
+        assert!(is_repeat(&previous, &["Music", "Speech"]));
+    }
+
+    #[test]
+    fn is_repeat_is_false_for_a_different_set() {
+        let previous = Some(label_set(&["Speech"]));
+        assert!(!is_repeat(&previous, &["Music"]));
+        // A subset or superset is still a different set.
+        assert!(!is_repeat(&previous, &["Speech", "Music"]));
     }
 
     #[test]

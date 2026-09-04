@@ -4,6 +4,7 @@
 members = [
     "clips",
     "embed",
+    "embed_clip",
     "sounds",
 ]
 resolver = "2"

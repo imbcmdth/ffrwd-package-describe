@@ -1,7 +1,7 @@
 {
   "name": "ffrwd/describe",
   "version": "0.1.0",
-  "description": "(draft) Four describers over a file, hosted in wasm: clips takes X-CLIP's video tower one shot at a time to a 512-d vector, sounds runs AST over 10s audio windows to AudioSet labels as text rows, embed and embed_text put X-CLIP's text tower under those rows and under a search prompt so cos_similarity can rank one against the other. Speech comes from ffrwd/whisper and ffrwd/vad rather than a describer of its own.",
+  "description": "(draft) Four describers over a file, hosted in wasm: clips takes X-CLIP's video tower one shot at a time to a 512-d vector, sounds runs AST over 10s audio windows to AudioSet labels as text rows, embed and embed_text put a sentence embedder (all-MiniLM-L6-v2) under those rows and under a search prompt so cos_similarity can rank one against the other, embed_clip and embed_clip_text do the same with X-CLIP's text tower for ranking against clip_vectors. Speech comes from ffrwd/whisper and ffrwd/vad rather than a describer of its own.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
   "capabilities": [],
@@ -26,7 +26,9 @@
     "clips": "src/clips.sql",
     "sounds": "src/sounds.sql",
     "embed": "src/embed.sql",
-    "embed_text": "src/embed.sql"
+    "embed_text": "src/embed.sql",
+    "embed_clip": "src/embed.sql",
+    "embed_clip_text": "src/embed.sql"
   },
   "bin": {
     "describe": "recipes/describe.sql",
@@ -40,6 +42,12 @@
       "sha256": "87a87b51ae52efa549e6e48f3a3b41f4fe0e5b91e154afcda5d9ac8dd1b975b4"
     },
     "embed": {
+      "repo": "Xenova/all-MiniLM-L6-v2",
+      "revision": "751bff37182d3f1213fa05d7196b954e230abad9",
+      "file": "onnx/model.onnx",
+      "sha256": "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e"
+    },
+    "embed_clip": {
       "repo": "imbcmdth/xclip-onnx",
       "revision": "649f3c91b59cd24be316dc505e26eacf5cd00801",
       "file": "text_tower.onnx",

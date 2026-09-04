@@ -19,7 +19,8 @@ come next.
 | export | model | source | license | pinned at |
 | --- | --- | --- | --- | --- |
 | `clips` | X-CLIP video tower | [microsoft/xclip-base-patch16-kinetics-600](https://huggingface.co/microsoft/xclip-base-patch16-kinetics-600), exported by us | MIT | [imbcmdth/xclip-onnx](https://huggingface.co/imbcmdth/xclip-onnx) |
-| `embed`, `embed_text` | X-CLIP text tower | same source model, exported by us | MIT | [imbcmdth/xclip-onnx](https://huggingface.co/imbcmdth/xclip-onnx) |
+| `embed`, `embed_text` | all-MiniLM-L6-v2, fp32 | [Xenova/all-MiniLM-L6-v2](https://huggingface.co/Xenova/all-MiniLM-L6-v2) | Apache-2.0 | pinned in `ffrwd.json` |
+| `embed_clip`, `embed_clip_text` | X-CLIP text tower | same source model as `clips`, exported by us | MIT | [imbcmdth/xclip-onnx](https://huggingface.co/imbcmdth/xclip-onnx) |
 | `sounds` | AST fp32 | [onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX](https://huggingface.co/onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX) | BSD-3-Clause | pinned in `ffrwd.json` |
 | speech | whisper-medium, int8 | not this package - `ffrwd/whisper` depends on [imbcmdth/whisper-medium-onnx](https://huggingface.co/imbcmdth/whisper-medium-onnx) | Apache-2.0 | `ffrwd/whisper`'s own manifest |
 

@@ -1,7 +1,8 @@
 -- Everything describe knows about a file, one row: the streams
 -- themselves, sounds and speech as cue rows, and every embedding
 -- find.sql later ranks against - clip vectors straight from the video
--- tower, sound/speech vectors from the text tower over their own rows.
+-- tower, sound/speech vectors from a sentence embedder over their own
+-- rows.
 -- variables: src (input media path), dest (output path, an .mkv: the rows become its metadata tracks)
 -- example: ffrwd compile -f packages/ffrwd/describe/recipes/describe.sql -v src=film.mp4 -v dest=film.described.mkv
 COPY (

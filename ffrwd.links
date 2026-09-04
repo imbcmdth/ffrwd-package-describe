@@ -1,0 +1,12 @@
+{
+  "format_version": 2,
+  "machine_local": "the packages this machine reads live out of working directories; not for version control",
+  "links": [
+    {
+      "name": "ffrwd/whisper"
+    },
+    {
+      "name": "ffrwd/shots"
+    }
+  ]
+}

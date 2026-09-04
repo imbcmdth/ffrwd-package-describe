@@ -1,40 +1,33 @@
-//! A sentence embedder, reached two ways.
+//! X-CLIP's text tower, reached two ways.
 //!
-//! `embed_text` is a value function: one prompt in, one 384-d vector out,
-//! computed at compile time like any other value call. `embed` is a rows
-//! module: it reads whatever produced its `cue[]` argument - sounds's
-//! labels, or a transcript's words, either shape - and writes one vector
-//! beside each row, no stream involved. Both tokenize their text the same
-//! way and run the same graph; the manifest pins the one ONNX file both
-//! load, under the export name `embed`.
+//! `embed_clip_text` is a value function: one prompt in, one 512-d vector
+//! out, computed at compile time like any other value call, ready to rank
+//! against `clips`'s video-tower vectors. `embed_clip` is a rows module:
+//! it reads whatever produced its `cue[]` argument and writes one vector
+//! beside each row in the same clip space. Both tokenize their text the
+//! same way and run the same graph; the manifest pins the one ONNX file
+//! both load, under the export name `embed_clip`.
 //!
-//! The model is all-MiniLM-L6-v2: a sentence embedder, trained to match one
-//! sentence against another. A CLIP text tower - what `embed_clip`/
-//! `embed_clip_text` put under the clip space instead - is trained to match
-//! images, not sentences, and ranks a short label well but not a spoken
-//! sentence; this module is what a cue's `text` (an AudioSet label, a
-//! transcript word) gets embedded with, so it ranks correctly against a
-//! search prompt in the same sentence space.
+//! This is a different space from `embed`/`embed_text`, which put a
+//! sentence embedder under sound and speech rows: a CLIP text tower is
+//! trained to match images, not sentences, so it ranks a cue's short label
+//! well but not a spoken sentence - `embed_clip`/`embed_clip_text` exist for
+//! callers that want the clip space on purpose, not as the default row
+//! embedder.
 //!
 //! Every vector this module returns is L2-normalized, so `cos_similarity`
-//! between any two of them is a plain dot product.
+//! between any two of them - or between one of these and a video-tower
+//! vector from `clips` - is a plain dot product.
 //!
-//! The tokenizer is bert-base-uncased's WordPiece (vocab 30522, `[CLS]`/
-//! `[SEP]`/`[PAD]`). Rather than hand-writing that, this module embeds the
-//! `tokenizers` crate's own `tokenizer.json` - fetched from the source
-//! model's revision, `assets/fetch-tokenizer.py` - compiled in with
+//! The tokenizer is CLIP's own byte-level BPE: vocab 49408, `<|startoftext|>`
+//! (49406) and `<|endoftext|>` (49407) as bos/eos, lowercased, the `</w>`
+//! word-end convention. Rather than hand-writing that BPE, this module
+//! embeds the `tokenizers` crate's own `tokenizer.json` - fetched from the
+//! source model's revision, `assets/fetch-tokenizer.py` - compiled in with
 //! `include_bytes!`. A wasm module has no filesystem: `wasi-nn`'s
 //! `load-by-name` reaches the ONNX graph by name alone, and there is no
 //! parallel mechanism for a non-graph file, so the tokenizer's vocabulary
 //! travels inside the module rather than beside it.
-//!
-//! The ONNX graph's `input_ids`/`attention_mask`/`token_type_ids` all take a
-//! dynamic sequence length, so - unlike a CLIP tower's fixed context - a
-//! prompt is truncated to `MAX_TOKENS` but never padded: one call is one
-//! sequence, exactly as long as the text tokenized to. `last_hidden_state`
-//! comes back one 384-d row per token; `mean_pool` collapses that to one
-//! vector, weighted by the attention mask the same way sentence-transformers
-//! itself pools this model's output.
 
 // `generate_all`: the world's interfaces come from two other packages -
 // ffrwd:av and wasi:nn - and without it bindgen expects them to have been
@@ -42,7 +35,7 @@
 wit_bindgen::generate!({
     path: ["wit", "wit-world"],
     // Fully qualified: three packages are in scope, and each has worlds.
-    world: "ffrwd:embed/embed",
+    world: "ffrwd:embed-clip/embed-clip",
     generate_all,
 });
 
@@ -53,60 +46,57 @@ use exports::ffrwd::av::rows_module::{Guest as RowsGuest, RowsModuleMeta};
 use exports::ffrwd::av::values::{FunctionMeta, Guest as ValuesGuest};
 use ffrwd::av::types::Meta;
 use serde::{Deserialize, Serialize};
-use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::{
+    PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection, TruncationParams,
+    TruncationStrategy,
+};
 use wasi::nn::graph::{load_by_name, Graph};
 use wasi::nn::inference::GraphExecutionContext;
 use wasi::nn::tensor::{Tensor, TensorType};
 
-/// The name the host binds the graph to: `-nn embed=<path>`.
-const MODEL: &str = "embed";
+/// The name the host binds the graph to: `-nn embed_clip=<path>`.
+const MODEL: &str = "embed_clip";
 
-/// What the export calls its three inputs, each `[1, n]` i64.
+/// What the export calls its two inputs, both `[1, MAX_TOKENS]` i64.
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
-const TOKEN_TYPE_IDS: &str = "token_type_ids";
-/// What the export calls its output, `[1, n, VECTOR_LEN]` f32.
-const OUTPUT_NAME: &str = "last_hidden_state";
+/// What the export calls its output, `[1, VECTOR_LEN]` f32.
+const OUTPUT_NAME: &str = "text_embeds";
 
-/// A prompt longer than this is truncated - the graph takes any sequence
-/// length, so this is a cap chosen for the model's own training length
-/// rather than a shape the graph fixes.
-const MAX_TOKENS: usize = 256;
-/// The model's output width.
-const VECTOR_LEN: usize = 384;
+/// CLIP's own fixed context length: every prompt is padded or truncated to
+/// exactly this many tokens.
+const MAX_TOKENS: usize = 77;
+/// The tower's output width.
+const VECTOR_LEN: usize = 512;
+/// `<|endoftext|>`, doubling as the pad token - the tokenizer's own
+/// convention, matched here rather than invented.
+const EOS_ID: u32 = 49407;
+const EOS_TOKEN: &str = "<|endoftext|>";
 
-/// bert-base-uncased's WordPiece, exactly as `Xenova/all-MiniLM-L6-v2`
-/// published it at revision 751bff37182d3f1213fa05d7196b954e230abad9 -
+/// CLIP's byte-level BPE, exactly as `microsoft/xclip-base-patch16-kinetics-600`
+/// published it at revision e4921c41fc296102aae210d43d4127c5e3e51928 -
 /// `assets/fetch-tokenizer.py` re-fetches it, hash-checked. Compiled in
 /// because the module has no other way to reach it; see the module doc
 /// comment.
 const TOKENIZER_JSON: &[u8] = include_bytes!("../assets/tokenizer.json");
 
 /// The tokenizer, built twice from the same bytes: `raw` reports a prompt's
-/// true token count, untruncated, which is what tells whether a prompt ran
-/// past `MAX_TOKENS`; `truncated` is capped to `MAX_TOKENS` and nothing
-/// more - no padding, since one call is one sequence exactly as long as it
-/// tokenized to. Built once per instance and kept for every call after.
+/// true token count, unpadded and untruncated, which is what tells whether
+/// a prompt ran past `MAX_TOKENS`; `padded` is truncated and padded to
+/// exactly `MAX_TOKENS`, which is what the graph's fixed-shape inputs need.
+/// Built once per instance and kept for every call after.
 struct Tok {
     raw: Tokenizer,
-    truncated: Tokenizer,
+    padded: Tokenizer,
 }
 
 fn tok() -> &'static Tok {
     static TOK: OnceLock<Tok> = OnceLock::new();
     TOK.get_or_init(|| {
-        // The published tokenizer.json bakes in its own truncation and
-        // padding (128, fixed) - both are overridden explicitly here rather
-        // than trusted: this module never pads (see the module doc comment),
-        // and MAX_TOKENS is this module's own cap, not the file's.
-        let mut raw =
+        let raw = Tokenizer::from_bytes(TOKENIZER_JSON).expect("embedded tokenizer.json parses");
+        let mut padded =
             Tokenizer::from_bytes(TOKENIZER_JSON).expect("embedded tokenizer.json parses");
-        raw.with_truncation(None)
-            .expect("clearing truncation always succeeds");
-        raw.with_padding(None);
-        let mut truncated =
-            Tokenizer::from_bytes(TOKENIZER_JSON).expect("embedded tokenizer.json parses");
-        truncated
+        padded
             .with_truncation(Some(TruncationParams {
                 max_length: MAX_TOKENS,
                 strategy: TruncationStrategy::LongestFirst,
@@ -114,20 +104,25 @@ fn tok() -> &'static Tok {
                 stride: 0,
             }))
             .expect("truncation params are well-formed");
-        truncated.with_padding(None);
-        Tok { raw, truncated }
+        padded.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(MAX_TOKENS),
+            direction: tokenizers::PaddingDirection::Right,
+            pad_to_multiple_of: None,
+            pad_id: EOS_ID,
+            pad_type_id: 0,
+            pad_token: EOS_TOKEN.to_string(),
+        }));
+        Tok { raw, padded }
     })
 }
 
-/// One prompt, tokenized to at most `MAX_TOKENS` - never padded, so `ids`,
-/// `mask` and `type_ids` are all exactly the same length, the true token
-/// count up to the cap. `truncated` is true when the prompt's true token
-/// count - `[CLS]`/`[SEP]` included - ran past `MAX_TOKENS` and some of its
-/// text was therefore dropped.
+/// One prompt, tokenized to the tower's fixed shape: `ids` and `mask` are
+/// both exactly `MAX_TOKENS` long. `truncated` is true when the prompt's
+/// true token count - bos and eos included - ran past `MAX_TOKENS` and some
+/// of its text was therefore dropped.
 struct Tokenized {
     ids: Vec<i64>,
     mask: Vec<i64>,
-    type_ids: Vec<i64>,
     truncated: bool,
 }
 
@@ -140,7 +135,7 @@ fn tokenize(text: &str) -> Result<Tokenized, String> {
         .get_ids()
         .len();
     let encoding = t
-        .truncated
+        .padded
         .encode(text, true)
         .map_err(|e| format!("tokenize: {e}"))?;
     let ids = encoding.get_ids().iter().map(|&id| id as i64).collect();
@@ -149,11 +144,9 @@ fn tokenize(text: &str) -> Result<Tokenized, String> {
         .iter()
         .map(|&m| m as i64)
         .collect();
-    let type_ids = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
     Ok(Tokenized {
         ids,
         mask,
-        type_ids,
         truncated: true_len > MAX_TOKENS,
     })
 }
@@ -173,7 +166,7 @@ fn failed(what: &str, error: &wasi::nn::errors::Error) -> String {
         ErrorCode::Security => "security",
         ErrorCode::Unknown => "unknown",
     };
-    format!("embed: {what}: {code} ({})", error.data())
+    format!("embed_clip: {what}: {code} ({})", error.data())
 }
 
 /// The graph and its execution context, built once per instance and kept
@@ -219,7 +212,7 @@ fn le_f32s(data: &[u8]) -> Vec<f32> {
 
 /// The named tensor's bytes out of what a compute answered, checked against
 /// the element count its shape fixes. Takes plain bytes rather than the
-/// wit-bindgen `Tensor` resource - `run_model` converts immediately after
+/// wit-bindgen `Tensor` resource - `run_tower` converts immediately after
 /// `compute`, which is what lets this function (and its tests) run as
 /// ordinary Rust: `Tensor` is a host resource, unreachable outside a real
 /// wasm import.
@@ -231,29 +224,27 @@ fn take_output(
     let Some(pos) = outputs.iter().position(|(n, _)| n == name) else {
         let unclaimed: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
         return Err(format!(
-            "embed: the graph answered without {name:?} (unclaimed: {unclaimed:?}); \
-             this module wants all-MiniLM-L6-v2's last_hidden_state"
+            "embed_clip: the graph answered without {name:?} (unclaimed: {unclaimed:?}); \
+             this module wants X-CLIP's text tower export"
         ));
     };
     let (_, bytes) = outputs.swap_remove(pos);
     let values = le_f32s(&bytes);
     if values.len() != len {
         return Err(format!(
-            "embed: {name} came back as {} numbers, expected {len}",
+            "embed_clip: {name} came back as {} numbers, expected {len}",
             values.len()
         ));
     }
     Ok(values)
 }
 
-/// One tokenized prompt through the graph: `last_hidden_state`, one
-/// `VECTOR_LEN`-wide row per token, flattened token-major.
-fn run_model(ids: &[i64], mask: &[i64], type_ids: &[i64]) -> Result<Vec<f32>, String> {
-    let seq_len = ids.len() as u32;
-    let dims = [1, seq_len];
+/// One tokenized prompt through the graph: the raw, un-normalized 512-d
+/// output.
+fn run_tower(ids: &[i64], mask: &[i64]) -> Result<Vec<f32>, String> {
+    let dims = [1, MAX_TOKENS as u32];
     let ids_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mask_bytes: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let type_bytes: Vec<u8> = type_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
 
     with_context(|context| {
         let inputs = vec![
@@ -265,49 +256,18 @@ fn run_model(ids: &[i64], mask: &[i64], type_ids: &[i64]) -> Result<Vec<f32>, St
                 ATTENTION_MASK.to_string(),
                 Tensor::new(&dims, TensorType::I64, &mask_bytes),
             ),
-            (
-                TOKEN_TYPE_IDS.to_string(),
-                Tensor::new(&dims, TensorType::I64, &type_bytes),
-            ),
         ];
         let outputs = context.compute(inputs).map_err(|e| failed("compute", &e))?;
         let outputs: Vec<(String, Vec<u8>)> = outputs
             .into_iter()
             .map(|(name, tensor)| (name, tensor.data()))
             .collect();
-        take_output(outputs, OUTPUT_NAME, ids.len() * VECTOR_LEN)
+        take_output(outputs, OUTPUT_NAME, VECTOR_LEN)
     })
 }
 
-/// `last_hidden_state`'s `seq_len` rows of `VECTOR_LEN` floats each,
-/// averaged into one row, each token weighted by `mask` - the same masked
-/// mean sentence-transformers itself pools this model's output with.
-/// `mask` is 0 only where a token was padding, so with no padding at all
-/// (this module never pads) it reduces to a plain mean over every token.
-fn mean_pool(hidden: &[f32], mask: &[i64], seq_len: usize) -> Vec<f32> {
-    let mut pooled = vec![0.0f32; VECTOR_LEN];
-    let mut weight = 0.0f32;
-    for (row, &m) in (0..seq_len).zip(mask) {
-        let m = m as f32;
-        if m == 0.0 {
-            continue;
-        }
-        weight += m;
-        let start = row * VECTOR_LEN;
-        for (p, &v) in pooled.iter_mut().zip(&hidden[start..start + VECTOR_LEN]) {
-            *p += v * m;
-        }
-    }
-    if weight > 0.0 {
-        for p in &mut pooled {
-            *p /= weight;
-        }
-    }
-    pooled
-}
-
 /// `vector` divided by its own L2 norm, so `cos_similarity` between any two
-/// of these is a plain dot product. A zero vector - which a trained model
+/// of these is a plain dot product. A zero vector - which a trained tower
 /// never actually produces - is returned as is rather than manufacturing a
 /// direction from nothing.
 fn l2_normalize(mut vector: Vec<f32>) -> Vec<f32> {
@@ -320,7 +280,7 @@ fn l2_normalize(mut vector: Vec<f32>) -> Vec<f32> {
     vector
 }
 
-/// One prompt or row's text, tokenized, run through the model, pooled and
+/// One prompt or row's text, tokenized, run through the tower and
 /// normalized. `on_truncated` is called when the text ran past
 /// `MAX_TOKENS`, so each caller can say what it was that got cut.
 fn embed(text: &str, on_truncated: impl FnOnce()) -> Result<Vec<f32>, String> {
@@ -328,17 +288,15 @@ fn embed(text: &str, on_truncated: impl FnOnce()) -> Result<Vec<f32>, String> {
     if tokenized.truncated {
         on_truncated();
     }
-    let seq_len = tokenized.ids.len();
-    let hidden = run_model(&tokenized.ids, &tokenized.mask, &tokenized.type_ids)?;
-    let pooled = mean_pool(&hidden, &tokenized.mask, seq_len);
-    Ok(l2_normalize(pooled))
+    let raw = run_tower(&tokenized.ids, &tokenized.mask)?;
+    Ok(l2_normalize(raw))
 }
 
-const EMBED_TEXT: &str = "embed_text";
-const EMBED_TEXT_PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}"#;
-const EMBED_TEXT_RESULT_SCHEMA: &str = r#"{"type":"array","items":{"type":"number"},"minItems":384,"maxItems":384,"description":"all-MiniLM-L6-v2 output, mean-pooled and L2-normalized so cos_similarity(a, b) is a plain dot product."}"#;
+const EMBED_CLIP_TEXT: &str = "embed_clip_text";
+const EMBED_CLIP_TEXT_PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}"#;
+const EMBED_CLIP_TEXT_RESULT_SCHEMA: &str = r#"{"type":"array","items":{"type":"number"},"minItems":512,"maxItems":512,"description":"X-CLIP text tower output, L2-normalized so cos_similarity(a, b) is a plain dot product."}"#;
 
-/// `args`' one string field named `field` - `embed_text`'s `"prompt"`.
+/// `args`' one string field named `field` - `embed_clip_text`'s `"prompt"`.
 fn extract_string_arg(name: &str, args: &str, field: &str) -> Result<String, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(args).map_err(|e| format!("{name}: args is not valid JSON: {e}"))?;
@@ -356,7 +314,7 @@ const ROWS_PARAMS_SCHEMA: &str =
 /// shape `sounds`'s labels and a transcript's words both take.
 const INPUT_ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"text":{"type":"string"}},"required":["start_t","end_t","text"],"additionalProperties":true}"#;
 /// What `process` writes: the same span, `text` replaced by its vector.
-const OUTPUT_ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"},"minItems":384,"maxItems":384}},"required":["start_t","end_t","vector"],"additionalProperties":false,"description":"vector is all-MiniLM-L6-v2 output, mean-pooled and L2-normalized so cos_similarity(a, b) is a plain dot product."}"#;
+const OUTPUT_ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"},"minItems":512,"maxItems":512}},"required":["start_t","end_t","vector"],"additionalProperties":false,"description":"vector is X-CLIP text tower output, L2-normalized so cos_similarity(a, b) is a plain dot product."}"#;
 
 /// One input row `process` reads: a cue, extra keys ignored by `serde`'s
 /// own default (unknown fields are simply not collected).
@@ -375,21 +333,21 @@ struct OutRow {
     vector: Vec<f32>,
 }
 
-/// This module takes no parameters: the model and its tokenizer are fixed.
+/// This module takes no parameters: the tower and its tokenizer are fixed.
 fn validate_params(params: &str) -> Result<(), String> {
     match params.trim() {
         "" | "{}" => Ok(()),
-        other => Err(format!("embed takes no params, got: {other}")),
+        other => Err(format!("embed_clip takes no params, got: {other}")),
     }
 }
 
 fn process_row(row: &str) -> Result<String, String> {
     let cue: InCue =
-        serde_json::from_str(row).map_err(|e| format!("embed: {row}: not a cue: {e}"))?;
+        serde_json::from_str(row).map_err(|e| format!("embed_clip: {row}: not a cue: {e}"))?;
     let start_t = cue.start_t;
     let vector = embed(&cue.text, || {
         eprintln!(
-            "embed: row at start_t={start_t}: text ran past {MAX_TOKENS} tokens and was truncated"
+            "embed_clip: row at start_t={start_t}: text ran past {MAX_TOKENS} tokens and was truncated"
         );
     })?;
     serde_json::to_string(&OutRow {
@@ -397,44 +355,44 @@ fn process_row(row: &str) -> Result<String, String> {
         end_t: cue.end_t,
         vector,
     })
-    .map_err(|e| format!("embed: serializing a row: {e}"))
+    .map_err(|e| format!("embed_clip: serializing a row: {e}"))
 }
 
-struct Embed;
+struct EmbedClip;
 
-impl ValuesGuest for Embed {
+impl ValuesGuest for EmbedClip {
     fn list_functions() -> Vec<FunctionMeta> {
         vec![FunctionMeta {
-            name: EMBED_TEXT.to_string(),
-            params_schema: EMBED_TEXT_PARAMS_SCHEMA.to_string(),
-            result_schema: EMBED_TEXT_RESULT_SCHEMA.to_string(),
+            name: EMBED_CLIP_TEXT.to_string(),
+            params_schema: EMBED_CLIP_TEXT_PARAMS_SCHEMA.to_string(),
+            result_schema: EMBED_CLIP_TEXT_RESULT_SCHEMA.to_string(),
         }]
     }
 
     fn invoke(name: String, args: String) -> Result<String, String> {
         match name.as_str() {
-            EMBED_TEXT => {
-                let prompt = extract_string_arg(EMBED_TEXT, &args, "prompt")?;
+            EMBED_CLIP_TEXT => {
+                let prompt = extract_string_arg(EMBED_CLIP_TEXT, &args, "prompt")?;
                 let vector = embed(&prompt, || {
                     eprintln!(
-                        "embed_text: prompt ran past {MAX_TOKENS} tokens and was truncated: {prompt:?}"
+                        "embed_clip_text: prompt ran past {MAX_TOKENS} tokens and was truncated: {prompt:?}"
                     );
                 })?;
                 serde_json::to_string(&vector)
-                    .map_err(|e| format!("{EMBED_TEXT}: serializing result: {e}"))
+                    .map_err(|e| format!("{EMBED_CLIP_TEXT}: serializing result: {e}"))
             }
             other => Err(format!(
-                "embed does not export {other}; it exports {EMBED_TEXT}"
+                "embed_clip does not export {other}; it exports {EMBED_CLIP_TEXT}"
             )),
         }
     }
 }
 
-impl RowsGuest for Embed {
+impl RowsGuest for EmbedClip {
     fn describe() -> RowsModuleMeta {
         RowsModuleMeta {
             meta: Meta {
-                name: "embed".to_string(),
+                name: "embed_clip".to_string(),
                 version: "0.1.0".to_string(),
                 params_schema: ROWS_PARAMS_SCHEMA.to_string(),
                 rows_schema: OUTPUT_ROWS_SCHEMA.to_string(),
@@ -450,7 +408,7 @@ impl RowsGuest for Embed {
 
     fn init(params: String) -> Result<(), String> {
         validate_params(&params)?;
-        // Fail fast: a run missing `-nn embed=<path>` is refused here,
+        // Fail fast: a run missing `-nn embed_clip=<path>` is refused here,
         // before any row is read, rather than on the first `process` call.
         with_context(|_| Ok(()))
     }
@@ -466,81 +424,68 @@ impl RowsGuest for Embed {
     }
 }
 
-export!(Embed);
+export!(EmbedClip);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Computed once from the reference tokenizer (transformers'
-    // AutoTokenizer over the same tokenizer.json) and pinned here as plain
-    // expected values - see the crate's own report for how. `[CLS]` is 101,
-    // `[SEP]` is 102.
-    const A_DOG_BARKING_OUTSIDE: [i64; 6] = [101, 1037, 3899, 19372, 2648, 102];
-    const CARGO_SHIP: [i64; 11] = [
-        101, 2053, 2166, 2001, 2179, 7548, 1996, 28839, 6636, 2911, 102,
+    // CLIPTokenizer, same revision as TOKENIZER_JSON) and pinned here as
+    // plain expected values - see the crate's own report for how.
+    const A_PHOTO_OF_A_CAT: [i64; 7] = [49406, 320, 1125, 539, 320, 2368, 49407];
+    const A_DOG_BARKING_OUTSIDE: [i64; 6] = [49406, 320, 1929, 32676, 2782, 49407];
+    const A_PERSON_RIDING: [i64; 12] = [
+        49406, 320, 2533, 6765, 320, 11652, 1136, 518, 2012, 536, 3424, 49407,
     ];
 
     #[test]
     fn known_prompts_tokenize_to_the_reference_ids() {
         for (text, expected) in [
+            ("a photo of a cat", &A_PHOTO_OF_A_CAT[..]),
             ("a dog barking outside", &A_DOG_BARKING_OUTSIDE[..]),
             (
-                "no life was found aboard the derelict cargo ship",
-                &CARGO_SHIP[..],
+                "a person riding a bicycle down the street at sunset",
+                &A_PERSON_RIDING[..],
             ),
         ] {
             let tokenized = tokenize(text).expect("tokenizes");
-            assert_eq!(tokenized.ids, expected, "text: {text}");
+            assert_eq!(&tokenized.ids[..expected.len()], expected, "text: {text}");
             assert!(!tokenized.truncated, "text: {text}");
-            // No padding: mask and type_ids are all-ones/all-zeros at the
-            // true token count, not some fixed shape.
-            assert_eq!(tokenized.mask.len(), expected.len());
-            assert!(tokenized.mask.iter().all(|&m| m == 1), "text: {text}");
-            assert!(tokenized.type_ids.iter().all(|&t| t == 0), "text: {text}");
+            assert_eq!(tokenized.ids.len(), MAX_TOKENS);
+            assert_eq!(tokenized.mask.len(), MAX_TOKENS);
+            // The mask is 1 for bos..eos and 0 for every pad slot after.
+            let ones = expected.len();
+            assert!(
+                tokenized.mask[..ones].iter().all(|&m| m == 1),
+                "text: {text}"
+            );
+            assert!(
+                tokenized.mask[ones..].iter().all(|&m| m == 0),
+                "text: {text}"
+            );
+            // Padding fills with eos, matching transformers' own convention.
+            assert!(
+                tokenized.ids[ones..].iter().all(|&id| id == EOS_ID as i64),
+                "text: {text}"
+            );
         }
     }
 
     #[test]
-    fn a_prompt_past_max_tokens_is_reported_truncated_and_capped() {
-        let long = "word ".repeat(400);
+    fn a_prompt_past_max_tokens_is_reported_truncated() {
+        let long = "word ".repeat(100);
         let tokenized = tokenize(long.trim()).expect("tokenizes");
         assert!(tokenized.truncated);
         assert_eq!(tokenized.ids.len(), MAX_TOKENS);
-        assert_eq!(tokenized.mask.len(), MAX_TOKENS);
+        // Truncation still ends on eos: the content is cut, not the tail.
+        assert_eq!(*tokenized.ids.last().unwrap(), EOS_ID as i64);
+        assert!(tokenized.mask.iter().all(|&m| m == 1));
     }
 
     #[test]
     fn a_short_prompt_is_not_reported_truncated() {
-        let tokenized = tokenize("hello").expect("tokenizes");
-        assert!(!tokenized.truncated);
-        assert!(tokenized.ids.len() < MAX_TOKENS);
-    }
-
-    #[test]
-    fn mean_pool_averages_unmasked_rows() {
-        // Two tokens, VECTOR_LEN 3 for the test's own sake would need
-        // VECTOR_LEN itself changed, so this drives mean_pool through its
-        // real width with a hidden state that is the same value repeated
-        // per row, checked against the row count instead.
-        let seq_len = 3;
-        let mut hidden = vec![0.0f32; seq_len * VECTOR_LEN];
-        for row in 0..seq_len {
-            for col in 0..VECTOR_LEN {
-                hidden[row * VECTOR_LEN + col] = (row + 1) as f32;
-            }
-        }
-        // Row 2 (value 3.0) is masked out.
-        let pooled = mean_pool(&hidden, &[1, 1, 0], seq_len);
-        // Mean of rows 0 and 1: (1.0 + 2.0) / 2 = 1.5, every column.
-        assert!(pooled.iter().all(|&v| (v - 1.5).abs() < 1e-6));
-    }
-
-    #[test]
-    fn mean_pool_of_an_all_masked_row_set_is_the_zero_vector() {
-        let hidden = vec![5.0f32; VECTOR_LEN];
-        let pooled = mean_pool(&hidden, &[0], 1);
-        assert!(pooled.iter().all(|&v| v == 0.0));
+        assert!(!tokenize("hello").expect("tokenizes").truncated);
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -579,7 +524,7 @@ mod tests {
         assert!(validate_params("").is_ok());
         assert!(validate_params("{}").is_ok());
         let Err(err) = validate_params(r#"{"lang":"es"}"#) else {
-            panic!("embed takes no params and should refuse one");
+            panic!("embed_clip takes no params and should refuse one");
         };
         assert!(err.contains("no params"), "got: {err}");
     }
@@ -588,29 +533,29 @@ mod tests {
     fn take_output_names_what_it_got_when_the_wanted_tensor_is_missing() {
         let error = take_output(
             vec![("other".to_string(), zero_bytes())],
-            "last_hidden_state",
-            VECTOR_LEN,
+            "text_embeds",
+            512,
         )
-        .expect_err("last_hidden_state is not among the outputs");
-        assert!(error.contains("last_hidden_state"), "{error}");
+        .expect_err("text_embeds is not among the outputs");
+        assert!(error.contains("text_embeds"), "{error}");
         assert!(error.contains("other"), "{error}");
     }
 
     #[test]
     fn take_output_refuses_a_tensor_of_the_wrong_length() {
         let error = take_output(
-            vec![("last_hidden_state".to_string(), zero_bytes())],
-            "last_hidden_state",
-            VECTOR_LEN,
+            vec![("text_embeds".to_string(), zero_bytes())],
+            "text_embeds",
+            512,
         )
-        .expect_err("only 4 numbers, not VECTOR_LEN");
-        assert!(error.contains("last_hidden_state"), "{error}");
+        .expect_err("only 4 numbers, not 512");
+        assert!(error.contains("text_embeds"), "{error}");
     }
 
-    /// 4 zero f32s' little-endian bytes - too short to be a real output,
-    /// which is the point in the two tests above. Plain bytes, the way
-    /// `run_model` hands `take_output` a compute's answer, rather than the
-    /// wit-bindgen `Tensor` resource: `Tensor` is a host resource and
+    /// 4 zero f32s' little-endian bytes - too short to be a real 512-d
+    /// output, which is the point in the two tests above. Plain bytes, the
+    /// way `run_tower` hands `take_output` a compute's answer, rather than
+    /// the wit-bindgen `Tensor` resource: `Tensor` is a host resource and
     /// unreachable outside a real wasm import, so nothing in this test
     /// module constructs one.
     fn zero_bytes() -> Vec<u8> {
@@ -620,15 +565,16 @@ mod tests {
     #[test]
     fn extract_string_arg_reads_the_named_field() {
         assert_eq!(
-            extract_string_arg("embed_text", r#"{"prompt":"a cat"}"#, "prompt").expect("present"),
+            extract_string_arg("embed_clip_text", r#"{"prompt":"a cat"}"#, "prompt")
+                .expect("present"),
             "a cat"
         );
     }
 
     #[test]
     fn extract_string_arg_refuses_a_missing_field() {
-        let error =
-            extract_string_arg("embed_text", r#"{}"#, "prompt").expect_err("prompt is missing");
+        let error = extract_string_arg("embed_clip_text", r#"{}"#, "prompt")
+            .expect_err("prompt is missing");
         assert!(error.contains("prompt"), "{error}");
     }
 }
