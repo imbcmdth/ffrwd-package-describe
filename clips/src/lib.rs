@@ -62,7 +62,10 @@ const CAP: f64 = 10.0;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"}}},"required":["start_t","end_t","vector"],"additionalProperties":false}"#;
+// `vector`'s minItems/maxItems fix EMBEDDING as the track's `vector_dims`:
+// the compiler reads them at compile time, since it cannot count a
+// run-time module's rows itself.
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"},"minItems":512,"maxItems":512}},"required":["start_t","end_t","vector"],"additionalProperties":false}"#;
 
 /// One shot's row: the seconds it covers, and what the tower made of it.
 #[derive(Serialize)]
