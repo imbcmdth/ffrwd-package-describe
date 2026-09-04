@@ -7,7 +7,7 @@
 COPY (
   WITH d AS (
     SELECT f.video[1] AS v, f.audio[1] AS a,
-           ffrwd.describe.clips(f.video[1]).shots   AS clip,
+           ffrwd.describe.clips(ffrwd.shots.simple_detector(f.video[1])).shots AS clip,
            ffrwd.describe.sounds(f.audio[1]).labels AS sound,
            ffrwd.whisper.transcribe(f.audio[1], ffrwd.vad.speech(f.audio[1]).segments).words AS speech
     FROM input(:'src') f

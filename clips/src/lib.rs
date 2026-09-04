@@ -2,19 +2,18 @@
 //! untouched; each shot leaves behind one row - its own seconds and a 512-d
 //! vector, unit length, in the space `embed_text` writes into.
 //!
-//! Where one shot ends and the next begins is this module's own: each frame's
-//! luma is reduced to a small grid of cell averages and compared with the
-//! previous frame's, and a mean absolute difference above the threshold is a
-//! cut. It is the same detector the fleet's `shots` module runs, carried here
-//! because a package's SQL has no way to name a module that is not itself a
-//! package.
+//! Where one shot ends and the next begins is not this module's to decide: a
+//! `{"shot": n}` row arriving with a frame - `ffrwd.shots.simple_detector`,
+//! composed ahead of this call - closes the shot running when its value
+//! changes. A repeated value does not, and a frame with no such row leaves
+//! the shot open. With no shot rows at all, the whole input is one shot.
 //!
 //! A shot is described by eight frames evenly spread over it, resized and
 //! normalized the way the checkpoint's own preprocessing declares. The eight
 //! are chosen while the shot runs - see `reservoir` - and the tower runs once
-//! when the shot ends: at a cut, at ten seconds, or when the stream does. A
-//! shot longer than ten seconds therefore leaves several rows, each covering
-//! its own stretch.
+//! when the shot ends: at a new shot value, at ten seconds, or when the
+//! stream does. A shot longer than ten seconds therefore leaves several rows,
+//! each covering its own stretch.
 //!
 //! The module never opens a file - the host binds the graph to a name with
 //! `-nn clips=<path>` and this module asks for that name and nothing else.
@@ -29,7 +28,6 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-mod cuts;
 mod prep;
 mod reservoir;
 
@@ -39,7 +37,7 @@ use exports::ffrwd::av::window_filter::{
     Format, FramePayload, Guest, InWindow, Meta, OutFrame, Processed, StreamInfo, WindowMeta,
 };
 use ffrwd::av::types::Rational;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasi::nn::graph::{load_by_name, Graph};
 use wasi::nn::inference::GraphExecutionContext;
 use wasi::nn::tensor::{Tensor, TensorType};
@@ -72,6 +70,29 @@ struct Row {
     start_t: f64,
     end_t: f64,
     vector: Vec<f32>,
+}
+
+/// A row naming which shot its frame belongs to. A row shaped any other way
+/// is not one of these and is ignored.
+#[derive(Deserialize)]
+struct ShotRow {
+    shot: i64,
+}
+
+/// The shot index a frame's rows name, if any of them does. The last one
+/// wins.
+fn shot_of(rows: &[String]) -> Option<i64> {
+    rows.iter()
+        .filter_map(|row| serde_json::from_str::<ShotRow>(row).ok())
+        .map(|row| row.shot)
+        .next_back()
+}
+
+/// Whether an incoming shot value ends the shot running: a value different
+/// from the one running does, the first value seen sets the baseline
+/// instead, and a frame with no shot row changes nothing.
+fn is_new_shot(current: Option<i64>, incoming: Option<i64>) -> bool {
+    matches!((current, incoming), (Some(a), Some(b)) if a != b)
 }
 
 /// The stretch being described: where it started, where it has reached, and
@@ -111,10 +132,8 @@ struct Opened {
     pix_fmt: PixFmt,
     /// Seconds one timestamp tick is worth, from the stream's time base.
     tick: f64,
-    /// The previous frame's luma cells, absent until a frame has been seen.
-    previous: Option<Vec<u8>>,
-    /// The current frame's cells, reused every frame.
-    cells: Vec<u8>,
+    /// The shot value running, absent until a shot row has arrived.
+    current_shot: Option<i64>,
     /// The newest frame's pixels, kept so a shot's last frame can join the
     /// eight even when the reservoir's spacing passed over it.
     newest: Vec<u8>,
@@ -253,24 +272,19 @@ fn close(opened: &mut Opened, mut segment: Segment) -> Result<String, String> {
     serde_json::to_string(&row).map_err(|e| format!("clips: the row would not serialize: {e}"))
 }
 
-/// One frame: the cut check, the row a cut or the cap ends, and the frame
-/// joining whatever stretch it belongs to.
-fn step(opened: &mut Opened, pts: i64, frame: &[u8]) -> Result<Vec<String>, String> {
-    let mut cells = std::mem::take(&mut opened.cells);
-    cuts::downsample(
-        frame,
-        opened.pix_fmt,
-        opened.width,
-        opened.height,
-        &mut cells,
-    );
-    let cut = match &opened.previous {
-        Some(previous) => cuts::is_cut(previous, &cells),
-        None => false,
-    };
-    // These cells become the previous frame's; the ones they replace go back
-    // to being the scratch buffer.
-    opened.cells = opened.previous.replace(cells).unwrap_or_default();
+/// One frame: the shot-row check, the row a new shot or the cap ends, and
+/// the frame joining whatever stretch it belongs to.
+fn step(
+    opened: &mut Opened,
+    pts: i64,
+    rows_in: &[String],
+    frame: &[u8],
+) -> Result<Vec<String>, String> {
+    let shot = shot_of(rows_in);
+    let cut = is_new_shot(opened.current_shot, shot);
+    if let Some(shot) = shot {
+        opened.current_shot = Some(shot);
+    }
 
     let mut rows = Vec::new();
     if ends_stretch(cut, opened.segment.as_ref(), pts, opened.tick) {
@@ -309,12 +323,12 @@ impl Guest for Clips {
             },
             window: 1,
             stride: 1,
-            // The reservoir and the previous frame's cells carry over between
+            // The reservoir and the running shot value carry over between
             // calls.
             pure: false,
             one_to_one: true,
-            // The shot bounds are this module's own, read off the pictures.
-            reads_rows: false,
+            // The shot bounds come from rows a module upstream produced.
+            reads_rows: true,
             // What leaves a frame is this module's vectors and nothing else.
             forwards_rows: false,
             // One stream in, which is every module here.
@@ -345,8 +359,7 @@ impl Guest for Clips {
                 height: video.height as usize,
                 pix_fmt,
                 tick,
-                previous: None,
-                cells: Vec::new(),
+                current_shot: None,
                 newest: Vec::new(),
                 segment: None,
                 context,
@@ -370,11 +383,13 @@ impl Guest for Clips {
                 .expect("init loads the graph before any frame arrives");
             for i in 0..window.len() {
                 let pts = window.pts(i);
+                let rows_in = window.rows(i);
                 let frame = window.fetch(i);
                 // `process` has no way to say no, so a graph that failed
                 // mid-stream stops the run rather than writing a vector that
                 // describes nothing.
-                let rows = step(opened, pts, &frame).unwrap_or_else(|message| panic!("{message}"));
+                let rows = step(opened, pts, &rows_in, &frame)
+                    .unwrap_or_else(|message| panic!("{message}"));
                 frames.push(OutFrame {
                     pts,
                     frame: FramePayload::Same,
@@ -499,5 +514,34 @@ mod tests {
         assert!(validate_params("{}").is_ok());
         let error = validate_params(r#"{"threshold":9}"#).expect_err("no params exist");
         assert!(error.contains("clips takes no params"), "{error}");
+    }
+
+    #[test]
+    fn a_shot_row_is_read_and_a_row_shaped_any_other_way_is_not() {
+        assert_eq!(shot_of(&[r#"{"shot":3}"#.to_string()]), Some(3));
+        assert_eq!(shot_of(&[r#"{"start_t":0,"end_t":1}"#.to_string()]), None);
+        assert_eq!(shot_of(&[]), None);
+        assert_eq!(
+            shot_of(&[r#"{"shot":1}"#.to_string(), r#"{"shot":2}"#.to_string()]),
+            Some(2),
+            "the last shot row a frame carries is the one that counts"
+        );
+    }
+
+    #[test]
+    fn a_new_shot_value_ends_the_shot_running_and_a_repeat_does_not() {
+        assert!(is_new_shot(Some(0), Some(1)));
+        assert!(!is_new_shot(Some(1), Some(1)));
+    }
+
+    #[test]
+    fn the_first_shot_row_sets_the_baseline_without_ending_anything() {
+        assert!(!is_new_shot(None, Some(0)));
+    }
+
+    #[test]
+    fn a_frame_with_no_shot_row_ends_nothing() {
+        assert!(!is_new_shot(Some(0), None));
+        assert!(!is_new_shot(None, None));
     }
 }
