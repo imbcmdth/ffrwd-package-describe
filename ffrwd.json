@@ -6,8 +6,9 @@
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
   "capabilities": [],
   "dependencies": {
-    "ffrwd/wasm": "0.14.0",
     "ffrwd/shots": "0.1.0",
+    "ffrwd/vad": "0.1.0",
+    "ffrwd/wasm": "0.14.0",
     "ffrwd/whisper": "0.1.0"
   },
   "keywords": [
