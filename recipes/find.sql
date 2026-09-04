@@ -9,11 +9,6 @@
 -- (or the reverse) even when that row's branch would never have kept it.
 -- Splitting into two UNION ALL branches, each filtered to its own track by
 -- AND before its own cos_similarity, keeps every call inside its own space.
---
--- `start =>`/`end =>` here match the trim/atrim options as named upstream;
--- a registry fix for that spelling is pending - until then a caller who
--- hits UNKNOWN_FILTER_OPTION on this recipe should use `starti =>`/
--- `endi =>` instead.
 -- variables: src (input media path, already described), prompt (search text), threshold (cosine similarity cutoff, e.g. 0.25), dest (output path)
 -- example: ffrwd compile -f packages/ffrwd/describe/recipes/find.sql -v src=film.described.mkv -v prompt='a dog barking' -v threshold=0.25 -v dest=clips.mp4
 COPY (
