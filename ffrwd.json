@@ -1,7 +1,7 @@
 {
   "name": "ffrwd/describe",
   "version": "0.1.0",
-  "description": "(draft) Four describers over a file, hosted in wasm: clips takes X-CLIP's video tower one shot at a time to a 512-d vector, sounds runs AST over 10s audio windows to AudioSet labels as text rows, embed and embed_text put a sentence embedder (all-MiniLM-L6-v2) under those rows and under a search prompt so cos_similarity can rank one against the other, embed_clip and embed_clip_text do the same with X-CLIP's text tower for ranking against clip_vectors. Speech comes from ffrwd/whisper and ffrwd/vad rather than a describer of its own.",
+  "description": "Four describers over a file, hosted in wasm: clips takes X-CLIP's video tower one shot at a time to a 512-d vector, sounds runs AST over 10s audio windows to AudioSet labels as text rows, embed and embed_text put a sentence embedder (all-MiniLM-L6-v2) under those rows and under a search prompt so cos_similarity can rank one against the other, embed_clip and embed_clip_text do the same with X-CLIP's text tower for ranking against clip_vectors. Speech comes from ffrwd/whisper and ffrwd/vad rather than a describer of its own.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
   "capabilities": ["nn"],
