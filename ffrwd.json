@@ -1,11 +1,14 @@
 {
   "name": "ffrwd/describe",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Four AI describers over a file that generate embedding vectors suitable for a cosine similarity search.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
-  "capabilities": ["nn"],
+  "capabilities": [
+    "nn"
+  ],
   "dependencies": {
+    "ffrwd/index": "0.1.0",
     "ffrwd/shots": "0.1.0",
     "ffrwd/vad": "0.1.0",
     "ffrwd/wasm": "0.14.0",
@@ -32,7 +35,9 @@
   },
   "bin": {
     "describe": "recipes/describe.sql",
-    "find": "recipes/find.sql"
+    "describe-video": "recipes/describe-video.sql",
+    "find": "recipes/find.sql",
+    "find-video": "recipes/find-video.sql"
   },
   "models": {
     "clips": {
@@ -59,5 +64,6 @@
       "file": "onnx/model.onnx",
       "sha256": "249b57721b7752442ec10dc3ace6f7dcd3ff0460d2c98a8709925ce5b72b69e0"
     }
-  }
+  },
+  "test": "sh scripts/check.sh"
 }
