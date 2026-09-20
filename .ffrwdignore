@@ -1,10 +1,30 @@
-# Build output. The files the lib SQL names are pulled back in by the
-# manifest's closure; the rest of the directory stays out of the archive.
+# What sits at the package root and is not package content. The archive is
+# the manifest's closure, so none of this would ship anyway; naming it here
+# is what says the omission was decided rather than forgotten.
+
+# Build output. The four .wasm files the lib SQL names are pulled back in by
+# the closure; the rest of the directory stays out. build/ is the X-CLIP
+# ONNX export, an input to that build.
 target/
 build/
 
-# The wit the modules' build.rs copies in, once there is a build.rs.
+# The wit each module's build.rs copies out of the installed ffrwd/wasm.
 wit/
 
-# Local development state, not package content.
+# The Rust workspace that builds the four modules. The modules ship; their
+# sources are read on GitHub.
+Cargo.toml
+Cargo.lock
+clips/
+sounds/
+embed/
+embed_clip/
+
+# The check script the manifest's "test" runs and the X-CLIP export script,
+# both of which run in a checkout and neither of which an installed package
+# reaches for.
+scripts/
+
+# Local development state: which archive of each dependency this checkout
+# resolved to, which a consumer solves for itself.
 ffrwd.lock
