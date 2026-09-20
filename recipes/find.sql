@@ -15,6 +15,12 @@
 -- cos_similarity keeps every call inside one space; a branch whose
 -- space the file does not carry matches nothing and drops out.
 --
+-- Every branch also drops a record whose span ends where it starts,
+-- which would otherwise become a zero-length trim. describe.sql
+-- narrows the shot rows before it weaves them, so a file this package
+-- wrote carries none; this is for every other file, which a search
+-- has no reason to trust the writer of.
+--
 -- WHICH SPACE IS WHICH. A record carries a space id, and weave hands
 -- ids out in the order its space table declares them, from zero. This
 -- recipe does not rely on that. It joins ffrwd.index.spaces, which
@@ -32,6 +38,7 @@ COPY (
   FROM input(:'src') f, ffrwd.index.records(f.video[1]) v
        JOIN ffrwd.index.spaces(f.video[1]) s ON v.space = s.space
   WHERE s.modality = 'picture'
+    AND v.end_t > v.start_t
     AND cos_similarity(v.vector, ffrwd.describe.embed_clip_text(:'prompt')) > :threshold
   UNION ALL
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(g.video[1],  start => w.start_t, end => w.end_t))),
@@ -39,6 +46,7 @@ COPY (
   FROM input(:'src') g, ffrwd.index.records(g.video[1]) w
        JOIN ffrwd.index.spaces(g.video[1]) t ON w.space = t.space
   WHERE t.modality = 'sound-text'
+    AND w.end_t > w.start_t
     AND cos_similarity(w.vector, ffrwd.describe.embed_text(:'prompt')) > :threshold
   UNION ALL
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(h.video[1],  start => x.start_t, end => x.end_t))),
@@ -46,5 +54,6 @@ COPY (
   FROM input(:'src') h, ffrwd.index.records(h.video[1]) x
        JOIN ffrwd.index.spaces(h.video[1]) y ON x.space = y.space
   WHERE y.modality = 'speech'
+    AND x.end_t > x.start_t
     AND cos_similarity(x.vector, ffrwd.describe.embed_text(:'prompt')) > :threshold
 ) TO :'dest'
