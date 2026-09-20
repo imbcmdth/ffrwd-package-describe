@@ -1,41 +1,38 @@
--- Everything describe knows about a file, written into the file: one
--- X-CLIP vector a shot, woven into the video's own encoded packets by
--- ffrwd.index.weave, the audio beside it, and the AudioSet labels and
--- the transcript as caption tracks. find.sql ranks the vectors; the
--- caption tracks are text, for reading.
+-- Everything describe knows about a file, written into the file: three
+-- spaces of embedding vectors woven into the video's own encoded
+-- packets by ffrwd.index.weave, the audio beside them, and the
+-- AudioSet labels and the transcript as caption tracks. find.sql ranks
+-- the vectors; the caption tracks are text, for reading.
 --
--- The vectors no longer ride a Matroska subtitle track, so the
--- destination is no longer a .mkv: MP4 takes the same query. The two
+-- THE THREE SPACES. One per rows argument, and the argument's own name
+-- is what puts a row in a space, so the names in the table below are
+-- weave's parameter names. clip is X-CLIP's video tower over each
+-- shot, searched by its text tower - two different networks, which is
+-- why model and query differ there and not in the other two. sound and
+-- speech are the same sentence embedder over two different kinds of
+-- text, kept apart because a space declaration carries one modality
+-- and a reader that wanted only what was said could not tell them
+-- apart if they shared an id. The URIs and the digests are this
+-- package's own manifest, and a digest is the first sixteen bytes of
+-- the SHA-256 the manifest gives.
+--
+-- THE DESTINATION is any container, not an .mkv: the vectors are in
+-- the picture's own packets and no longer in a Matroska track. The two
 -- caption columns are written without an alias, because an alias is a
 -- track TITLE and a title is Matroska's alone; untitled they reach any
--- container that carries captions. Matroska writes them as WebVTT and
--- MP4 as mov_text, both in SELECT order, sound first and speech
--- second, and neither says which is which.
+-- container that carries captions.
 --
--- Shots come from ffrwd.shots.simple_detector, which reports a
--- zero-length shot on a fast cut. Those are filtered out before the
--- weave: a record whose span ends where it starts describes no frame,
--- and find.sql would turn it into a zero-length trim.
+-- sounds() and transcribe() each appear twice, once for a caption
+-- track and once under embed(). That is two nodes and two runs of the
+-- model: a caption track is an input of the muxer and a rows document
+-- is a stage of its own, so the two cannot share one.
 --
--- SOUND AND SPEECH VECTORS ARE NOT WOVEN YET. They belong in weave's
--- `sound` and `speech` arguments, written as
---
---   ffrwd.describe.embed(ffrwd.describe.sounds(f.audio[1]).labels),
---   ffrwd.describe.embed(ffrwd.whisper.transcribe(ffrwd.vad.speech(f.audio[1])).words),
---
--- with their two spaces added to the table below. ffrwd refuses that
--- today, because embed is a rows module and a packet filter's rows
--- argument has to be a stream module's annotation column:
---
---   UDF_ARG_TYPE: ffrwd.index.weave() takes 'sound' as STRUCT(start_t
---   number, end_t number, vector vector)[], and its argument produces
---   no annotation column
---
--- Until that lifts, the two arguments are NULL and the space table
--- declares only the space that has vectors: a space declared here
--- rides every keyframe whether a record uses it or not, so declaring
--- three would tell every later reader the file carries vectors it does
--- not have.
+-- ZERO-LENGTH ROWS. simple_detector reports a zero-length shot on a
+-- fast cut, and a record whose span ends where it starts describes no
+-- frame. The clip rows are narrowed here, before the weave. The other
+-- two cannot be: embed is a rows function, and neither its output nor
+-- its input may be narrowed. find.sql filters all three again at read
+-- time, which is what catches those.
 --
 -- describe-video.sql is this recipe without the audio, for a source
 -- that has none.
@@ -47,14 +44,28 @@ COPY (
            ARRAY(SELECT s
                  FROM unnest(ffrwd.describe.clips(ffrwd.shots.simple_detector(f.video[1])).shots) s
                  WHERE s.end_t > s.start_t),
-           NULL,
-           NULL,
+           ffrwd.describe.embed(ffrwd.describe.sounds(f.audio[1]).labels),
+           ffrwd.describe.embed(ffrwd.whisper.transcribe(ffrwd.vad.speech(f.audio[1])).words),
            '[{"name":"clip","dims":512,"encoding":"i8","unit_length":false,
               "modality":"picture",
               "model":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/video_tower.onnx",
               "model_hash":"87a87b51ae52efa549e6e48f3a3b41f4",
               "query":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/text_tower.onnx",
               "query_hash":"c14df0fdda1ba530330e278b8fabeb0b",
+              "producer":"ffrwd/describe 0.1.2"},
+             {"name":"sound","dims":384,"encoding":"i8","unit_length":false,
+              "modality":"sound-text",
+              "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+              "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
+              "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+              "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
+              "producer":"ffrwd/describe 0.1.2"},
+             {"name":"speech","dims":384,"encoding":"i8","unit_length":false,
+              "modality":"speech",
+              "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+              "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
+              "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+              "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
               "producer":"ffrwd/describe 0.1.2"}]'),
          f.audio[1],
          ffrwd.describe.sounds(f.audio[1]).labels,

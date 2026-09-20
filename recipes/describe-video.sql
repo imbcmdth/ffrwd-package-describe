@@ -9,9 +9,14 @@
 -- STREAM_NOT_FOUND: 'f.audio[1]' does not exist.
 --
 -- Shots come from ffrwd.shots.simple_detector, which reports a
--- zero-length shot on a fast cut. Those are filtered out here rather
+-- zero-length shot on a fast cut. Those are narrowed out here rather
 -- than woven: a record whose span ends where it starts describes no
--- frame, and find.sql would turn it into a zero-length trim.
+-- frame, and a search over it would cut nothing.
+--
+-- One space, not describe.sql's three. A space declared to weave
+-- rides every keyframe whether a record uses it or not, so declaring
+-- sound and speech here would tell every later reader the file
+-- carries vectors it does not have.
 -- variables: src (input media path), dest (output path, .mp4 or .mkv)
 -- example: ffrwd compile -f packages/ffrwd/describe/recipes/describe-video.sql -v src=film.mp4 -v dest=film.described.mp4
 COPY (
