@@ -29,7 +29,7 @@ changes for a caller:
   the track never did.
 - `find.sql` reads the vectors back with `ffrwd.index.records`, a packet
   sink the compiler runs while the query compiles. It copies the keyframes
-  alone: on the 44 MB file below, 0.09% of the bytes.
+  alone: on the file below, 0.11% of the bytes.
 - Nothing about the file is ffrwd's. The format is
   [SPEC.md](https://github.com/imbcmdth/ffrwd-package-index/blob/main/SPEC.md),
   and `ffrwd-index read --mp4 film.described.mp4` prints every record and
@@ -111,28 +111,38 @@ the same column writes wherever captions do. So:
 Naming them again would cost MP4, which is the container this rewrite was
 for.
 
-### The sound and speech spaces are not woven yet
+### The three spaces
 
-`describe` declares one space and weaves one. The sound labels and the
-transcript are embedded by `embed`, which is a rows module: rows in, rows
-out, no stream. A packet filter's rows argument has to be a stream module's
-annotation column, so ffrwd refuses `embed`'s output where `weave`'s `sound`
-and `speech` arguments want it:
+`describe` declares and weaves three, one per rows argument of `weave`, and
+the argument's own name is what puts a row in a space.
 
-```
-UDF_ARG_TYPE: ffrwd.index.weave() takes 'sound' as STRUCT(start_t number,
-end_t number, vector vector)[], and its argument produces no annotation
-column (hint: write the column a module returns: ffrwd.index.weave(<stream>,
-<producer>(<stream>).<column>, ...), or NULL for no rows at all)
-```
+| space | modality | dims | model | query |
+| --- | --- | --- | --- | --- |
+| `clip` | `picture` | 512 | X-CLIP video tower | X-CLIP text tower |
+| `sound` | `sound-text` | 384 | all-MiniLM-L6-v2 | the same |
+| `speech` | `speech` | 384 | all-MiniLM-L6-v2 | the same |
 
-Until that lifts, the two arguments are `NULL` and the space table says so.
-A space declared to `weave` rides every keyframe whether a record uses it or
-not, so declaring three would tell every reader the file carries vectors it
-does not have. `describe.sql` carries the two lines to uncomment and the two
-declarations to add. `find` and `find-video` already have the branches: a
-branch whose space the file does not carry matches nothing and drops out, so
-they need no change when the vectors arrive.
+`clip` is the one whose two models differ: the video tower wrote the vectors
+and the text tower is what a search goes through. `sound` and `speech` are
+the same embedder over two kinds of text, and they are two spaces rather
+than one because a declaration carries one modality, and a reader that
+wanted only what was said could not tell them apart under one id.
+
+`describe-video` declares one. A space declared to `weave` rides every
+keyframe whether a record uses it or not, so a picture-only file described
+by the three-space recipe would tell every later reader it carries vectors
+it does not have.
+
+### The audio is decoded on the way through, for now
+
+`describe` writes the audio it read, sample for sample: the decoded PCM is
+bit-identical to the source's. It is not stream-copied, though. Placing a
+packet filter on the video makes the muxer read the audio off the pipe that
+already carries it for `sounds` and `vad` instead of opening the source for
+it, so the AAC is decoded to `pcm_f32le` and muxed as PCM, which costs about
+half the file size again. The same query without the `weave` call copies the
+AAC. `describe-video` is unaffected, and so is a `weave` whose query reads
+the audio nowhere else.
 
 ### Which space is which
 
@@ -147,19 +157,22 @@ thing in every file. The extra read is one packet.
 
 ## A run
 
-`film_dark.mp4`, sixty seconds of H.264 at 23.976 fps, 44 MB, no audio
-track. Trimmed output of the real commands, on 2026-09-19, against ffrwd
-0.17.4 and the `ffrwd/index` modules built from its checkout.
+Sixty seconds of H.264 at 23.976 fps with a pink-noise AAC track, 45 MB.
+Trimmed output of the real commands, on 2026-09-19, against ffrwd 0.17.4 and
+the `ffrwd/index` modules built from its checkout.
 
 ```
-$ ffrwd run ffrwd/describe:describe-video -v src=film_dark.mp4 -v dest=described.mp4
+$ ffrwd run ffrwd/describe:describe -v src=toned.mp4 -v dest=described.mp4
 ```
 
-Thirteen shots, thirteen records, 9 seconds. Against the same query with
-the `weave` call taken out: 14485 bytes more at MP4 and 14352 at Matroska,
-0.033% of the file either way; identical `framemd5` over the video; and
-identical packet times, durations included. The video reaches `weave` as a
-stream copy and leaves it as one, so no picture is encoded and none moves.
+Fifteen records in three spaces: thirteen shots, one sound label, one
+transcript cue. 72 seconds to MP4, 59 to Matroska. The records cost the
+video stream 29341 bytes, 0.066% of it, and the same in both containers.
+Every picture is the source's own: `framemd5` over the video agrees across
+the source, the described MP4, the described Matroska and the same query
+with the `weave` call taken out, and every video packet's presentation time,
+decode time and duration is the unwoven query's. The decoded audio is
+bit-identical too, which is the section above on how it got there.
 
 ```
 $ ffrwd-index read --mp4 described.mp4
@@ -168,41 +181,76 @@ $ ffrwd-index read --mp4 described.mp4
   "model_hash":"87a87b51ae52efa549e6e48f3a3b41f4",
   "query":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/text_tower.onnx",
   "query_hash":"c14df0fdda1ba530330e278b8fabeb0b","producer":"ffrwd/describe 0.1.2"}}
-described.mp4: scan keyframes: 30 of 1438 samples, 46259 of 44295684 bytes read (0.10% of the file), 34 seeks
+{"space":{"id":1,"dims":384,"encoding":"i8","unit_length":false,"modality":"sound-text","source":0,
+  "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+  "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
+  "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.1.2"}}
+{"space":{"id":2,"dims":384,"encoding":"i8","unit_length":false,"modality":"speech","source":0,
+  "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+  "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
+  "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
+  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.1.2"}}
+described.mp4: scan keyframes: 30 of 1438 samples, 73032 of 67352161 bytes read (0.11% of the file), 36 seeks
 ```
 
-(the space is one line in the file; wrapped here.)
+(each space is one line in the file; wrapped here.)
 
-Then the search. The compile is 3.6 seconds, of which most is the text
-tower embedding the prompt; the read of the file's own records is the
-keyframe copy above.
+Then two searches, one aimed at the picture and one at the sound. The same
+recipe serves both: the branches are told apart by modality, and the ones a
+prompt does not clear drop out.
 
 ```
-$ ffrwd compile -f recipes/find-video.sql -v src=described.mp4 \
+$ ffrwd compile -f recipes/find.sql -v src=described.mp4 \
     -v prompt='a car driving at night' -v threshold=0.23 -v dest=found.mp4
 ... trim=start=-0.083:end=3.838 ... trim=start=23.315:end=25.276
 ... trim=start=31.449:end=38.122 ... trim=start=41.167:end=43.419
 ... trim=start=46.338:end=53.596 ...
+
+$ ffrwd compile -f recipes/find.sql -v src=described.mkv \
+    -v prompt='a hiss of static noise' -v threshold=0.30 -v dest=found.mkv
+... trim=start=-0.083:end=9.917 ... atrim=start=-0.083:end=9.917 ...
 ```
 
-Five spans, 22.022 seconds cut out of sixty, and the same five off the
-`.mkv`. The same ranking over the binary32 the models produced, before the
+Five spans from the picture prompt, 22.022 seconds cut out of sixty, and the
+same five off the `.mkv`. One span from the sound prompt, 9.927 seconds, and
+it is the sound record: that prompt scores 0.496 against the sound space and
+0.014 against the speech space, so only one branch survives the threshold.
+
+The compile of `find` is 31 seconds on the machine this ran on, nearly all
+of it the two text towers loading; `find-video`, which the picture prompt
+alone needs, compiled the same file in 3.6 seconds with one tower. The read
+of the file's own records is the keyframe scan above and is not where the
+time goes.
+
+The same three rankings over the binary32 the models produced, before the
 8-bit encoding and before the file:
 
 ```
-$ ffrwd-index search --rows rows.ndjson --space xclip --query query_clip.json --top 5
+$ ffrwd-index search --rows rows.ndjson --space 1 --query query_clip.json --top 5
 {"rank":1,"score":0.247439,"start_t":41.250,"end_t":43.502,"space":1,"record_id":8}
 {"rank":2,"score":0.243536,"start_t":31.532,"end_t":38.205,"space":1,"record_id":6}
 {"rank":3,"score":0.240230,"start_t":46.421,"end_t":53.679,"space":1,"record_id":10}
 {"rank":4,"score":0.238564,"start_t":23.398,"end_t":25.359,"space":1,"record_id":4}
 {"rank":5,"score":0.236714,"start_t":0.000,"end_t":3.921,"space":1,"record_id":0}
+
+$ ffrwd-index search --rows rows.ndjson --space 3 --query query_noise.json --top 3
+{"rank":1,"score":0.496058,"start_t":0.000,"end_t":10.000,"space":3,"record_id":0}
+
+$ ffrwd-index search --rows rows.ndjson --space 2 --query query_noise.json --top 3
+{"rank":1,"score":0.013573,"start_t":30.000,"end_t":36.000,"space":2,"record_id":0}
 ```
 
-Same five records, same order. The scores differ in the fourth decimal and
-the spans by 83 milliseconds, which is two frames at 23.976 fps: the rows
-are on the source's clock, and a span read back out of the file is an offset
-from the picture it rides on, against presentation times an encode with
-B-frames does not put in coding order.
+Out of the file the same three read 0.247323, 0.496017 and 0.014074, in the
+same order, with the clip space's five records ranked the same way. The
+scores differ in the third or fourth decimal, which is the 8-bit encoding,
+and the spans by 83 milliseconds, which is two frames at 23.976 fps: the
+rows are on the source's clock, and a span read back out of the file is an
+offset from the picture it rides on, against presentation times an encode
+with B-frames does not put in coding order. (`ffrwd-index` numbers its own
+rows from one and `weave` numbers the file's from zero, which is why the
+space ids differ between the two halves and why `find` looks a space up
+rather than naming a number.)
 
 ## Building
 
@@ -226,12 +274,13 @@ sh scripts/check.sh
 
 `ffrwd.json`'s `test` command, so `ffrwd publish` runs it too. It generates
 an eight-second fixture with lavfi, silent and with a noise track, compiles
-every recipe, then describes and searches both. The two compile checks load
-no model: nothing in `describe.sql` or `describe-video.sql` runs while the
-query compiles, which is what makes them checkable on a machine with an
-empty model cache. The find recipes embed their prompt at compile time and
-read a file that has records in it, so they need the towers and a described
-fixture, and the script makes one.
+every recipe, then describes and searches both, checking the pictures
+against the source's own and that the file with sound declares all three
+spaces. The two compile checks load no model: nothing in `describe.sql` or
+`describe-video.sql` runs while the query compiles, which is what makes them
+checkable on a machine with an empty model cache. The find recipes embed
+their prompt at compile time and read a file that has records in it, so they
+need the towers and a described fixture, and the script makes one.
 
 ## Local development
 
@@ -250,22 +299,29 @@ index checkout with the dependency dropped:
 
 1. Build the ffrwd CLI and its sidecar from the unreleased checkout, into a
    virtualenv of their own, and point `FFRWD_WASM` at the built
-   `ffrwd-wasm`.
+   `ffrwd-wasm`. Give the session an ffrwd home of its own as well (`HOME`,
+   and `USERPROFILE` on Windows), because `ffrwd link` writes machine-wide
+   and a home of your own keeps the real record alone. Junction or symlink
+   `packages`, `models` and `nn-runtime` under it onto the real ones so
+   nothing is downloaded twice.
 2. Copy the `ffrwd/index` checkout. In the copy, delete `dependencies` from
    `ffrwd.json`.
 3. Build its three modules in the copy, against the same sidecar's wit:
    `FFRWD_WIT_DIR=<cli>/sidecar/wit cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces`.
    They have to land in the copy's own `target/`, because that is the path
-   `src/index.sql` names and a linked package resolves it in place.
+   `src/index.sql` names and a linked package resolves it in place. The
+   build fetches `ffrwd-nal` and `ffrwd-bmff` from GitHub by tag, so it
+   needs the network once.
 4. `ffrwd link` in the copy: it installs nothing and records
-   `ffrwd/index -> <copy>` machine-wide.
+   `ffrwd/index -> <copy>` in that home's links file.
 5. `ffrwd link ffrwd/index` here. The name goes in this project's
    `ffrwd.links`, never the lockfile, and shadows the `0.1.0` the manifest
    pins. Every command afterwards says so, which is the point:
    `warning: package 'ffrwd/index' is linked to <copy>, so this command
    depends on files no lockfile pins`.
 
-`ffrwd unlink ffrwd/index` puts the pin back.
+`ffrwd unlink ffrwd/index` puts the pin back, and `ffrwd unlink -g
+ffrwd/index` drops the machine-wide record from anywhere.
 
 ## License
 
