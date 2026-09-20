@@ -1,6 +1,6 @@
 {
   "name": "ffrwd/describe",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Four AI describers over a file that generate embedding vectors suitable for a cosine similarity search.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
