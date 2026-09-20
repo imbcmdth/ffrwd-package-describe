@@ -111,12 +111,36 @@ if [ -f "$WORK/described.mp4" ]; then
   fi
 fi
 if ffrwd run -f "$HERE/recipes/describe.sql" -v "src=$WORK/sound.mp4" \
-     -v "dest=$WORK/described_sound.mp4" -y -q >/dev/null 2>&1 &&
+     -v "dest=$WORK/described_sound.mp4" -y -q >/dev/null 2>&1; then
+  ok "describe.sql writes a file with sound"
+else
+  bad "describe.sql writes a file with sound"
+fi
+# Three spaces declared and three woven. The clip vectors arrive as an
+# annotation column and the other two out of a rows function, which are
+# two different ways into the same filter, so a run that got one and
+# not the others would still write a file that looked fine.
+if [ -f "$WORK/described_sound.mp4" ]; then
+  cat > "$WORK/spaces.sql" <<SQL
+COPY (
+  SELECT s.modality
+  FROM input('$WORK/described_sound.mp4') f, ffrwd.index.spaces(f.video[1]) s
+) TO '$WORK/spaces.json' WITH (format 'json')
+SQL
+  ffrwd run -f "$WORK/spaces.sql" -y -q >/dev/null 2>&1 || true
+  found=$(grep -c '"modality"' "$WORK/spaces.json" 2>/dev/null || true)
+  if [ "${found:-0}" -eq 3 ]; then
+    ok "the file declares three spaces"
+  else
+    bad "the file declares three spaces (found ${found:-0})"
+  fi
+fi
+if [ -f "$WORK/described_sound.mp4" ] &&
    ffrwd run -f "$HERE/recipes/find.sql" -v "src=$WORK/described_sound.mp4" \
      -v "prompt=colour bars" -v "threshold=0.0" -v "dest=$WORK/found_sound.mp4" -y -q >/dev/null 2>&1; then
-  ok "describe.sql and find.sql round-trip a file with sound"
+  ok "find.sql cuts video and audio back out"
 else
-  bad "describe.sql and find.sql round-trip a file with sound"
+  bad "find.sql cuts video and audio back out"
 fi
 
 say "done"
