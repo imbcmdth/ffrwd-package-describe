@@ -12,9 +12,10 @@ instead of shipping a third model for it.
 
 The four modules are built and run:
 `target/wasm32-wasip2/release/{clips,sounds,embed,embed_clip}.wasm`, all
-against the `ffrwd:av@0.16.0` world. That world is unreleased, so is
-`ffrwd/index`, and so is the ffrwd that hosts a packet filter; **Local
-development** below is the whole route.
+against the `ffrwd:av@0.14.0` world, which is the one `ffrwd/wasm` 0.14.0
+carries. Everything else this package needs is in the registry too, so
+`ffrwd install` is the whole of the setup. Weaving wants ffrwd 0.18.0 or
+newer, which is what hosts a packet filter.
 
 ## Where the vectors go
 
@@ -29,7 +30,7 @@ changes for a caller:
   the track never did.
 - `find.sql` reads the vectors back with `ffrwd.index.records`, a packet
   sink the compiler runs while the query compiles. It copies the keyframes
-  alone: on the file below, 0.11% of the bytes.
+  alone: on the file below, 0.19% of the bytes.
 - Nothing about the file is ffrwd's. The format is
   [SPEC.md](https://github.com/imbcmdth/ffrwd-package-index/blob/main/SPEC.md),
   and `ffrwd-index read --mp4 film.described.mp4` prints every record and
@@ -133,16 +134,15 @@ keyframe whether a record uses it or not, so a picture-only file described
 by the three-space recipe would tell every later reader it carries vectors
 it does not have.
 
-### The audio is decoded on the way through, for now
+### The audio is copied
 
-`describe` writes the audio it read, sample for sample: the decoded PCM is
-bit-identical to the source's. It is not stream-copied, though. Placing a
-packet filter on the video makes the muxer read the audio off the pipe that
-already carries it for `sounds` and `vad` instead of opening the source for
-it, so the AAC is decoded to `pcm_f32le` and muxed as PCM, which costs about
-half the file size again. The same query without the `weave` call copies the
-AAC. `describe-video` is unaffected, and so is a `weave` whose query reads
-the audio nowhere else.
+`describe` stream-copies the audio. The packets in the output are the
+source's own bytes, the codec is the source's codec, and the file is the
+source's size plus what the records cost. That holds even though `sounds`
+and `vad` read the same audio on the way past and even though the video
+carries a packet filter: ffrwd opens the source again for the stream it is
+copying rather than taking it off the pipe those two modules read. That is
+ffrwd 0.18.0's behaviour and one more reason this package asks for it.
 
 ### Which space is which
 
@@ -157,22 +157,24 @@ thing in every file. The extra read is one packet.
 
 ## A run
 
-Sixty seconds of H.264 at 23.976 fps with a pink-noise AAC track, 45 MB.
-Trimmed output of the real commands, on 2026-09-19, against ffrwd 0.17.4 and
-the `ffrwd/index` modules built from its checkout.
+Sixty seconds of H.264 at 23.976 fps with a pink-noise AAC track,
+45266864 bytes. Trimmed output of the real commands, on 2026-09-20, against
+ffrwd 0.18.0 and every package resolved from the registry.
 
 ```
 $ ffrwd run ffrwd/describe:describe -v src=toned.mp4 -v dest=described.mp4
 ```
 
 Fifteen records in three spaces: thirteen shots, one sound label, one
-transcript cue. 72 seconds to MP4, 59 to Matroska. The records cost the
+transcript cue. 34 seconds to MP4, 29 to Matroska, with the models already
+in the cache. The described MP4 is 45297349 bytes, so the records cost the
 video stream 29341 bytes, 0.066% of it, and the same in both containers.
-Every picture is the source's own: `framemd5` over the video agrees across
-the source, the described MP4, the described Matroska and the same query
-with the `weave` call taken out, and every video packet's presentation time,
-decode time and duration is the unwoven query's. The decoded audio is
-bit-identical too, which is the section above on how it got there.
+Every picture is the source's own: `framemd5` over the decoded video agrees
+across the source, the described MP4, the described Matroska and the same
+query with the `weave` call taken out, all 1438 frames of it, and every
+video packet's presentation time, decode time and duration is the unwoven
+query's. The audio is the source's own packets, byte for byte, in the
+source's own codec.
 
 ```
 $ ffrwd-index read --mp4 described.mp4
@@ -180,18 +182,18 @@ $ ffrwd-index read --mp4 described.mp4
   "model":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/video_tower.onnx",
   "model_hash":"87a87b51ae52efa549e6e48f3a3b41f4",
   "query":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/text_tower.onnx",
-  "query_hash":"c14df0fdda1ba530330e278b8fabeb0b","producer":"ffrwd/describe 0.1.2"}}
+  "query_hash":"c14df0fdda1ba530330e278b8fabeb0b","producer":"ffrwd/describe 0.2.0"}}
 {"space":{"id":1,"dims":384,"encoding":"i8","unit_length":false,"modality":"sound-text","source":0,
   "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
   "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
   "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
-  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.1.2"}}
+  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.2.0"}}
 {"space":{"id":2,"dims":384,"encoding":"i8","unit_length":false,"modality":"speech","source":0,
   "model":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
   "model_hash":"759c3cd2b7fe7e93933ad23c4c9181b7",
   "query":"hf:Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9/onnx/model.onnx",
-  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.1.2"}}
-described.mp4: scan keyframes: 30 of 1438 samples, 73032 of 67352161 bytes read (0.11% of the file), 36 seeks
+  "query_hash":"759c3cd2b7fe7e93933ad23c4c9181b7","producer":"ffrwd/describe 0.2.0"}}
+described.mp4: scan keyframes: 30 of 1438 samples, 84488 of 45297349 bytes read (0.19% of the file), 36 seeks
 ```
 
 (each space is one line in the file; wrapped here.)
@@ -212,16 +214,20 @@ $ ffrwd compile -f recipes/find.sql -v src=described.mkv \
 ... trim=start=-0.083:end=9.917 ... atrim=start=-0.083:end=9.917 ...
 ```
 
-Five spans from the picture prompt, 22.022 seconds cut out of sixty, and the
-same five off the `.mkv`. One span from the sound prompt, 9.927 seconds, and
+Five spans from the picture prompt, 22.065 seconds cut out of sixty, and the
+same five off the `.mkv`. One span from the sound prompt, 10 seconds, and
 it is the sound record: that prompt scores 0.496 against the sound space and
 0.014 against the speech space, so only one branch survives the threshold.
 
-The compile of `find` is 31 seconds on the machine this ran on, nearly all
-of it the two text towers loading; `find-video`, which the picture prompt
-alone needs, compiled the same file in 3.6 seconds with one tower. The read
-of the file's own records is the keyframe scan above and is not where the
-time goes.
+The compile of `find` is 5 seconds on the machine this ran on, most of it
+the two text towers loading; `find-video`, which the picture prompt alone
+needs, compiled a described file in 2.8 seconds with one tower. The read of
+the file's own records is the keyframe scan above and is not where the time
+goes.
+
+The silent pair over the same picture without its audio track: 9 seconds to
+describe, thirteen records in the one `picture` space, and `find-video` over
+the result cuts the same five spans the three-space file gave.
 
 The same three rankings over the binary32 the models produced, before the
 8-bit encoding and before the file:
@@ -254,14 +260,17 @@ rather than naming a number.)
 
 ## Building
 
+For a contributor with the checkout. An installed copy of the package needs
+none of this: the four modules travel in the archive.
+
 ```
-ffrwd install -g ffrwd/wasm
+ffrwd install
 cargo build --target wasm32-wasip2 --release
 ```
 
-`build.rs` copies the `ffrwd:av` wit out of the installed `ffrwd/wasm`
-package. `FFRWD_WIT_DIR` overrides that lookup, which is what a checkout
-building against an unreleased world needs.
+The install is what puts `ffrwd/wasm` where each module's `build.rs` can
+find it: the script asks `ffrwd path ffrwd/wasm` and copies the `ffrwd:av`
+wit out of the package, at the version the manifest pins.
 
 The X-CLIP ONNX export under `build/xclip` is `scripts/export_xclip.py`'s
 output, pinned to the revision the manifest names.
@@ -281,47 +290,6 @@ spaces. The two compile checks load no model: nothing in `describe.sql` or
 checkable on a machine with an empty model cache. The find recipes embed
 their prompt at compile time and read a file that has records in it, so they
 need the towers and a described fixture, and the script makes one.
-
-## Local development
-
-None of `ffrwd/index` 0.1.0, the `ffrwd:av@0.16.0` world or the ffrwd that
-hosts a packet filter is released, and `ffrwd/wasm` 0.16.0 is not in the
-registry either, so `ffrwd link` in the `ffrwd/index` checkout stops at
-
-```
-UNSUPPORTED_SQL: the registry has no version 0.16.0 of 'ffrwd/wasm'
-(hint: published: 0.9.0, ... 0.15.0)
-```
-
-`ffrwd/wasm` carries nothing but the wit a `build.rs` reads, and
-`FFRWD_WIT_DIR` supplies that directly, so the way through is a copy of the
-index checkout with the dependency dropped:
-
-1. Build the ffrwd CLI and its sidecar from the unreleased checkout, into a
-   virtualenv of their own, and point `FFRWD_WASM` at the built
-   `ffrwd-wasm`. Give the session an ffrwd home of its own as well (`HOME`,
-   and `USERPROFILE` on Windows), because `ffrwd link` writes machine-wide
-   and a home of your own keeps the real record alone. Junction or symlink
-   `packages`, `models` and `nn-runtime` under it onto the real ones so
-   nothing is downloaded twice.
-2. Copy the `ffrwd/index` checkout. In the copy, delete `dependencies` from
-   `ffrwd.json`.
-3. Build its three modules in the copy, against the same sidecar's wit:
-   `FFRWD_WIT_DIR=<cli>/sidecar/wit cargo build --release --target wasm32-wasip2 -p weave -p records -p spaces`.
-   They have to land in the copy's own `target/`, because that is the path
-   `src/index.sql` names and a linked package resolves it in place. The
-   build fetches `ffrwd-nal` and `ffrwd-bmff` from GitHub by tag, so it
-   needs the network once.
-4. `ffrwd link` in the copy: it installs nothing and records
-   `ffrwd/index -> <copy>` in that home's links file.
-5. `ffrwd link ffrwd/index` here. The name goes in this project's
-   `ffrwd.links`, never the lockfile, and shadows the `0.1.0` the manifest
-   pins. Every command afterwards says so, which is the point:
-   `warning: package 'ffrwd/index' is linked to <copy>, so this command
-   depends on files no lockfile pins`.
-
-`ffrwd unlink ffrwd/index` puts the pin back, and `ffrwd unlink -g
-ffrwd/index` drops the machine-wide record from anywhere.
 
 ## License
 
