@@ -3,7 +3,7 @@
 #
 #   sh scripts/check.sh [WORKDIR]
 #
-# What it needs: ffrwd 0.18.0 or newer and ffmpeg on the PATH, the four
+# What it needs: ffrwd 0.29 or newer and ffmpeg on the PATH, the four
 # modules built (cargo build --target wasm32-wasip2 --release), this
 # package's dependencies installed (ffrwd install) and the models already
 # in ffrwd's cache. Nothing is published.
@@ -14,7 +14,7 @@
 #
 # The compile-only half runs first and on its own terms: `ffrwd validate`
 # over describe.sql and describe-video.sql type-checks the whole query,
-# the weave's rows argument and its space table included, without a model
+# the weave's rows inputs and its space table included, without a model
 # being loaded, because nothing in those two runs at compile time. The
 # find recipes embed their prompt while they compile, so they cannot be
 # checked without the text towers, and they need a file with records in
@@ -116,10 +116,9 @@ if ffrwd run -f "$HERE/recipes/describe.sql" -v "src=$WORK/sound.mp4" \
 else
   bad "describe.sql writes a file with sound"
 fi
-# Three spaces declared and three woven. The clip vectors arrive as an
-# annotation column and the other two out of a rows function, which are
-# two different ways into the same filter, so a run that got one and
-# not the others would still write a file that looked fine.
+# Three spaces declared and three woven. Each arrives on an input of its
+# own from a producer of its own, so a run that got one and not the
+# others would still write a file that looked fine.
 if [ -f "$WORK/described_sound.mp4" ]; then
   cat > "$WORK/spaces.sql" <<SQL
 COPY (

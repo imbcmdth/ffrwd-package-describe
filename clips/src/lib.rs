@@ -1,48 +1,35 @@
-//! X-CLIP's video tower, one shot at a time. Every frame passes through
-//! untouched; each shot leaves behind one row - its own seconds and a 512-d
-//! vector, unit length, in the space `embed_text` writes into.
+//! X-CLIP's video tower, one shot at a time. Each shot leaves one row on
+//! `shots`: its own seconds and a 512-d vector, unit length, in the space
+//! `embed_clip_text` writes into. Nothing else leaves; a reader takes the
+//! picture from its source.
 //!
 //! Where one shot ends and the next begins is not this module's to decide: a
-//! `{"shot": n}` row arriving with a frame - `ffrwd.shots.simple_detector`,
-//! composed ahead of this call - closes the shot running when its value
+//! `{"shot": n}` row on `cuts` beside a frame (`ffrwd.shots.simple_detector`,
+//! read from the same picture) closes the shot running when its value
 //! changes. A repeated value does not, and a frame with no such row leaves
-//! the shot open. With no shot rows at all, the whole input is one shot.
+//! the shot open. With `cuts` unbound, the whole input is one shot.
 //!
 //! A shot is described by eight frames evenly spread over it, resized and
 //! normalized the way the checkpoint's own preprocessing declares. The eight
-//! are chosen while the shot runs - see `reservoir` - and the tower runs once
+//! are chosen while the shot runs (see `reservoir`) and the tower runs once
 //! when the shot ends: at a new shot value, at ten seconds, or when the
 //! stream does. A shot longer than ten seconds therefore leaves several rows,
-//! each covering its own stretch.
+//! each covering its own stretch, and a row leaves as late as the cap and the
+//! frame that reaches it.
 //!
-//! The module never opens a file - the host binds the graph to a name with
-//! `-nn clips=<path>` and this module asks for that name and nothing else.
-
-// `generate_all`: the world's interfaces come from two other packages -
-// ffrwd:av and wasi:nn - and without it bindgen expects them to have been
-// generated somewhere else.
-wit_bindgen::generate!({
-    path: ["wit", "wit-world"],
-    // Fully qualified: three packages are in scope, and each has worlds.
-    world: "ffrwd:describe-clips/clips",
-    generate_all,
-});
+//! Frames arrive as rgba, or as yuv420p converted here by ffrwd-frame in the
+//! range and matrix the stream declares.
 
 mod prep;
 mod reservoir;
 
-use std::cell::RefCell;
-
-use exports::ffrwd::av::window_filter::{
-    Format, FramePayload, Guest, InWindow, Meta, OutFrame, Processed, StreamInfo, WindowMeta,
-};
-use ffrwd::av::types::Rational;
+use describe_common::{le_bytes, le_f32s, normalize, Element, Feed, Model};
+use ffrwd_frame::yuv::{self, Colour, Yuv420p};
+use ffrwd_frame::Rgba;
+use ffrwd_node::{Bound, Init, Input, NoParams, Node, Out, Output, Rational, Result, Shape, Tick};
 use serde::{Deserialize, Serialize};
-use wasi::nn::graph::{load_by_name, Graph};
-use wasi::nn::inference::GraphExecutionContext;
-use wasi::nn::tensor::{Tensor, TensorType};
 
-use prep::{PixFmt, SIDE, TENSOR};
+use prep::{SIDE, TENSOR};
 use reservoir::{Reservoir, FRAMES};
 
 /// The name the host binds the graph to. `-nn clips=<path>`.
@@ -60,35 +47,28 @@ const EMBEDDING: usize = 512;
 /// something about them, where eight spread over five minutes do not.
 const CAP: f64 = 10.0;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+/// The frame past the cap that closes a stretch, which `shape` cannot size:
+/// it does not see the clock's rate. Half a second covers 2 fps and up.
+const FRAME_MARGIN: f64 = 0.5;
 
-// `vector`'s minItems/maxItems fix EMBEDDING as the track's `vector_dims`:
-// the compiler reads them at compile time, since it cannot count a
-// run-time module's rows itself.
+// `vector`'s minItems/maxItems fix EMBEDDING as the rows' `vector_dims`: the
+// compiler reads them at compile time, since it cannot count a run-time
+// module's rows itself.
 const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"},"minItems":512,"maxItems":512}},"required":["start_t","end_t","vector"],"additionalProperties":false}"#;
 
 /// One shot's row: the seconds it covers, and what the tower made of it.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Row {
     start_t: f64,
     end_t: f64,
     vector: Vec<f32>,
 }
 
-/// A row naming which shot its frame belongs to. A row shaped any other way
-/// is not one of these and is ignored.
-#[derive(Deserialize)]
-struct ShotRow {
+/// A row naming which shot its frame belongs to. A producer's other fields
+/// pass unread.
+#[derive(Default, Deserialize, Serialize)]
+struct Cut {
     shot: i64,
-}
-
-/// The shot index a frame's rows name, if any of them does. The last one
-/// wins.
-fn shot_of(rows: &[String]) -> Option<i64> {
-    rows.iter()
-        .filter_map(|row| serde_json::from_str::<ShotRow>(row).ok())
-        .map(|row| row.shot)
-        .next_back()
 }
 
 /// Whether an incoming shot value ends the shot running: a value different
@@ -119,7 +99,7 @@ impl Segment {
 /// Whether the frame at `pts` ends the stretch running: a cut does, and so
 /// does the cap, which is what keeps one long shot from being described by
 /// eight frames spread across minutes of it. The first frame of a stream ends
-/// nothing - there is no stretch yet.
+/// nothing; there is no stretch yet.
 fn ends_stretch(cut: bool, segment: Option<&Segment>, pts: i64, tick: f64) -> bool {
     let Some(segment) = segment else {
         return false;
@@ -127,90 +107,43 @@ fn ends_stretch(cut: bool, segment: Option<&Segment>, pts: i64, tick: f64) -> bo
     cut || (pts - segment.start_pts) as f64 * tick >= CAP
 }
 
-/// What `init` settled, plus the graph it loaded and where the stream has
-/// reached.
-struct Opened {
-    width: usize,
-    height: usize,
-    pix_fmt: PixFmt,
-    /// Seconds one timestamp tick is worth, from the stream's time base.
-    tick: f64,
-    /// The shot value running, absent until a shot row has arrived.
-    current_shot: Option<i64>,
-    /// The newest frame's pixels, kept so a shot's last frame can join the
-    /// eight even when the reservoir's spacing passed over it.
-    newest: Vec<u8>,
-    segment: Option<Segment>,
-    /// Held for the life of the instance: building it once is what keeps a
-    /// provider's kernels from being chosen again per frame.
-    context: GraphExecutionContext,
-    /// Kept alive because the context is only valid while its graph is.
-    _graph: Graph,
-}
-
-thread_local! {
-    static OPENED: RefCell<Option<Opened>> = const { RefCell::new(None) };
-}
-
-/// This module takes no parameters: a shot's bounds are its own and the
-/// tower's geometry is fixed.
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("clips takes no params, got: {other}")),
-    }
-}
-
-/// Seconds one timestamp tick is worth, which is what turns a frame's pts
+/// Seconds one timestamp unit is worth, which is what turns a frame's pts
 /// into the seconds a row carries.
 fn seconds_per_tick(time_base: Rational) -> f64 {
     f64::from(time_base.num) / f64::from(time_base.den)
 }
 
-/// The spec's spelling of an error code, so a message says what actually
-/// went wrong rather than how this module happens to format things.
-fn failed(what: &str, error: &wasi::nn::errors::Error) -> String {
-    use wasi::nn::errors::ErrorCode;
-    let code = match error.code() {
-        ErrorCode::InvalidArgument => "invalid-argument",
-        ErrorCode::InvalidEncoding => "invalid-encoding",
-        ErrorCode::Timeout => "timeout",
-        ErrorCode::RuntimeError => "runtime-error",
-        ErrorCode::UnsupportedOperation => "unsupported-operation",
-        ErrorCode::TooLarge => "too-large",
-        ErrorCode::NotFound => "not-found",
-        ErrorCode::Security => "security",
-        ErrorCode::Unknown => "unknown",
-    };
-    format!("clips: {what}: {code} ({})", error.data())
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Arrives {
+    Rgba,
+    Yuv420p(Colour),
 }
 
-/// A tensor's floats, out of the little-endian bytes it arrived as.
-fn le_f32s(data: &[u8]) -> Vec<f32> {
-    let (whole, _) = data.as_chunks::<4>();
-    whole.iter().copied().map(f32::from_le_bytes).collect()
+fn colour(color: Option<&ffrwd_node::ColorInfo>) -> Result<Colour, String> {
+    Colour::of(color.map(|color| yuv::ColorInfo {
+        range: &color.range,
+        primaries: &color.primaries,
+        trc: &color.trc,
+        space: &color.space,
+    }))
 }
 
-/// The floats as the little-endian bytes a tensor travels in.
-fn le_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = vec![0u8; values.len() * 4];
-    let (words, _) = bytes.as_chunks_mut::<4>();
-    for (word, value) in words.iter_mut().zip(values) {
-        *word = value.to_le_bytes();
-    }
-    bytes
-}
-
-/// The embedding scaled to unit length, which is what makes a dot product a
-/// cosine. A vector of all zeros has no direction and is left alone.
-fn normalize(mut vector: Vec<f32>) -> Vec<f32> {
-    let length = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if length > 0.0 {
-        for value in &mut vector {
-            *value /= length;
+/// One frame turned into the tower's tensor, by way of rgba.
+fn tensor_of(
+    arrives: Arrives,
+    bytes: &[u8],
+    scratch: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<Vec<f32>, String> {
+    let picture = match arrives {
+        Arrives::Rgba => Rgba::new(bytes, width, height)?,
+        Arrives::Yuv420p(colour) => {
+            yuv::to_rgba(&Yuv420p::new(bytes, width, height)?, colour, scratch)?;
+            Rgba::new(scratch, width, height)?
         }
-    }
-    vector
+    };
+    Ok(prep::preprocess(&picture))
 }
 
 /// The named tensor out of what a compute answered, checked against the
@@ -234,222 +167,225 @@ fn take(outputs: Vec<(String, Vec<u8>)>) -> Result<Vec<f32>, String> {
     Ok(values)
 }
 
-/// One clip through the tower: eight frames in, one unit vector out.
-fn run(opened: &mut Opened, input: &[f32]) -> Result<Vec<f32>, String> {
-    let dims = [1, FRAMES as u32, 3, SIDE as u32, SIDE as u32];
-    let feeds = vec![(
-        INPUT_NAME.to_string(),
-        Tensor::new(&dims, TensorType::Fp32, &le_bytes(input)),
-    )];
-    let returned = opened
-        .context
-        .compute(feeds)
-        .map_err(|e| failed("compute", &e))?;
-    let outputs: Vec<(String, Vec<u8>)> = returned
-        .into_iter()
-        .map(|(name, tensor)| (name, tensor.data()))
-        .collect();
-    Ok(normalize(take(outputs)?))
+struct Clips {
+    v: u32,
+    cuts: Option<u32>,
+    width: usize,
+    height: usize,
+    arrives: Arrives,
+    rgba: Vec<u8>,
+    /// Seconds one timestamp unit is worth, from the stream's time base.
+    tick: f64,
+    /// The shot value running, absent until a shot row has arrived.
+    current_shot: Option<i64>,
+    /// The newest frame's bytes, kept so a shot's last frame can join the
+    /// eight even when the reservoir's spacing passed over it.
+    newest: Vec<u8>,
+    segment: Option<Segment>,
+    model: Model,
 }
 
-/// The row a finished stretch leaves behind, the tower run once for it.
-fn close(opened: &mut Opened, mut segment: Segment) -> Result<String, String> {
-    let last = if segment.frames.holds_last() {
-        None
-    } else {
-        Some(prep::preprocess(
-            &opened.newest,
-            opened.pix_fmt,
-            opened.width,
-            opened.height,
-        ))
-    };
-    let input = segment.frames.close(last);
-    debug_assert_eq!(input.len(), FRAMES * TENSOR);
-    let vector = run(opened, &input)?;
-    let row = Row {
-        start_t: segment.start_pts as f64 * opened.tick,
-        end_t: segment.last_pts as f64 * opened.tick,
-        vector,
-    };
-    serde_json::to_string(&row).map_err(|e| format!("clips: the row would not serialize: {e}"))
-}
-
-/// One frame: the shot-row check, the row a new shot or the cap ends, and
-/// the frame joining whatever stretch it belongs to.
-fn step(
-    opened: &mut Opened,
-    pts: i64,
-    rows_in: &[String],
-    frame: &[u8],
-) -> Result<Vec<String>, String> {
-    let shot = shot_of(rows_in);
-    let cut = is_new_shot(opened.current_shot, shot);
-    if let Some(shot) = shot {
-        opened.current_shot = Some(shot);
+impl Clips {
+    /// One clip through the tower: eight frames in, one unit vector out.
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+        let dims = [1, FRAMES as u32, 3, SIDE as u32, SIDE as u32];
+        let bytes = le_bytes(input);
+        let outputs = self.model.run(&[Feed {
+            name: INPUT_NAME,
+            dimensions: &dims,
+            element: Element::F32,
+            data: &bytes,
+        }])?;
+        Ok(normalize(take(outputs)?))
     }
 
-    let mut rows = Vec::new();
-    if ends_stretch(cut, opened.segment.as_ref(), pts, opened.tick) {
-        let segment = opened.segment.take().expect("a stretch was running");
-        rows.push(close(opened, segment)?);
-    }
-
-    let segment = opened.segment.get_or_insert_with(|| Segment::new(pts));
-    segment.last_pts = pts;
-    let (pix_fmt, width, height) = (opened.pix_fmt, opened.width, opened.height);
-    segment
-        .frames
-        .offer(|| prep::preprocess(frame, pix_fmt, width, height));
-
-    opened.newest.clear();
-    opened.newest.extend_from_slice(frame);
-    Ok(rows)
-}
-
-struct Clips;
-
-impl Guest for Clips {
-    fn describe() -> WindowMeta {
-        WindowMeta {
-            meta: Meta {
-                name: "clips".to_string(),
-                version: "0.1.0".to_string(),
-                params_schema: PARAMS_SCHEMA.to_string(),
-                rows_schema: ROWS_SCHEMA.to_string(),
-                pixel_formats: vec!["yuv420p".to_string(), "rgba".to_string()],
-                // Not an audio module, so it names no sample formats.
-                sample_formats: vec![],
-                sample_rates: vec![],
-                channel_counts: vec![],
-                rows_language: vec![],
-            },
-            window: 1,
-            stride: 1,
-            // The reservoir and the running shot value carry over between
-            // calls.
-            pure: false,
-            one_to_one: true,
-            // The shot bounds come from rows a module upstream produced.
-            reads_rows: true,
-            // What leaves a frame is this module's vectors and nothing else.
-            forwards_rows: false,
-            // One stream in, which is every module here.
-            inputs: 1,
-        }
-    }
-
-    fn init(format: Format, stream_info: StreamInfo, params: String) -> Result<(), String> {
-        validate_params(&params)?;
-        let Format::Video(video) = format else {
-            return Err("clips reads pictures, and this stream is audio".to_string());
+    /// The row a finished stretch leaves behind, the tower run once for it.
+    fn close(&mut self, mut segment: Segment) -> Result<Row, String> {
+        let last = if segment.frames.holds_last() {
+            None
+        } else {
+            Some(tensor_of(
+                self.arrives,
+                &self.newest,
+                &mut self.rgba,
+                self.width,
+                self.height,
+            )?)
         };
-        let pix_fmt = PixFmt::parse(&video.pix_fmt)?;
-        let tick = seconds_per_tick(stream_info.time_base);
+        let input = segment.frames.close(last);
+        debug_assert_eq!(input.len(), FRAMES * TENSOR);
+        Ok(Row {
+            start_t: segment.start_pts as f64 * self.tick,
+            end_t: segment.last_pts as f64 * self.tick,
+            vector: self.run(&input)?,
+        })
+    }
 
-        // The graph is loaded once per instance, and the session built once:
-        // the first clip is what a provider picks its kernels on, and every
-        // clip after it reuses them.
-        let graph =
-            load_by_name(MODEL).map_err(|e| failed(&format!("load-by-name({MODEL:?})"), &e))?;
-        let context = graph
-            .init_execution_context()
-            .map_err(|e| failed("init-execution-context", &e))?;
+    /// One frame: the row a new shot or the cap ends, and the frame joining
+    /// whatever stretch it belongs to.
+    fn step(&mut self, pts: i64, shot: Option<i64>, frame: &[u8]) -> Result<Option<Row>, String> {
+        let cut = is_new_shot(self.current_shot, shot);
+        if let Some(shot) = shot {
+            self.current_shot = Some(shot);
+        }
 
-        OPENED.with(|o| {
-            *o.borrow_mut() = Some(Opened {
-                width: video.width as usize,
-                height: video.height as usize,
-                pix_fmt,
-                tick,
-                current_shot: None,
-                newest: Vec::new(),
-                segment: None,
-                context,
-                _graph: graph,
-            });
-        });
+        let mut row = None;
+        if ends_stretch(cut, self.segment.as_ref(), pts, self.tick) {
+            let segment = self.segment.take().expect("a stretch was running");
+            row = Some(self.close(segment)?);
+        }
+
+        let segment = self.segment.get_or_insert_with(|| Segment::new(pts));
+        segment.last_pts = pts;
+        let (arrives, width, height) = (self.arrives, self.width, self.height);
+        let scratch = &mut self.rgba;
+        segment
+            .frames
+            .offer(|| tensor_of(arrives, frame, scratch, width, height))?;
+
+        self.newest.clear();
+        self.newest.extend_from_slice(frame);
+        Ok(row)
+    }
+}
+
+fn emit(out: &mut Out, row: &Row) -> Result<(), String> {
+    let pts = out.pts("shots", row.start_t)?;
+    out.row("shots", pts, row)
+}
+
+impl Node for Clips {
+    const NAME: &'static str = "clips";
+    const VERSION: &'static str = "0.2.0";
+    type Params = NoParams;
+
+    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+        Ok(Shape::new()
+            .input(
+                Input::video("v")
+                    .clock()
+                    .pixel_formats(&["yuv420p", "rgba"]),
+            )
+            .input(Input::rows("cuts").optional().lockstep().schema::<Cut>())
+            .output(
+                Output::rows("shots")
+                    .time_base(Rational::MICROS)
+                    .latency(CAP + FRAME_MARGIN)
+                    .schema_json(ROWS_SCHEMA),
+            ))
+    }
+
+    fn init(_: NoParams, init: &Init) -> Result<Clips> {
+        let v = init.stream("v")?;
+        let video = v
+            .video_format()
+            .ok_or("clips reads pictures, and `v` is not video")?;
+        let (width, height) = (video.width as usize, video.height as usize);
+        let arrives = match video.pix_fmt.as_str() {
+            "rgba" => Arrives::Rgba,
+            "yuv420p" => Arrives::Yuv420p(colour(video.color.as_ref())?),
+            other => return Err(format!("clips does not accept pixel format {other}").into()),
+        };
+        Ok(Clips {
+            v: v.id,
+            cuts: init.optional("cuts").map(|cuts| cuts.id),
+            width,
+            height,
+            arrives,
+            rgba: match arrives {
+                Arrives::Rgba => Vec::new(),
+                Arrives::Yuv420p(_) => vec![0; width * height * 4],
+            },
+            tick: seconds_per_tick(v.info.time_base),
+            current_shot: None,
+            newest: Vec::new(),
+            segment: None,
+            model: Model::load("clips", MODEL)?,
+        })
+    }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        let shot = match self.cuts {
+            Some(cuts) => tick.rows::<Cut>(cuts)?.last().map(|cut| cut.shot),
+            None => None,
+        };
+        for frame in tick.frames(self.v) {
+            let bytes = tick.fetch(self.v, frame.index);
+            if let Some(row) = self.step(frame.pts, shot, &bytes)? {
+                emit(out, &row)?;
+            }
+        }
+        if tick.last() {
+            if let Some(segment) = self.segment.take() {
+                let row = self.close(segment)?;
+                emit(out, &row)?;
+            }
+        }
         Ok(())
     }
-
-    fn set_params(params: String) -> Result<(), String> {
-        validate_params(&params)
-    }
-
-    fn process(window: &InWindow, _trailing: Vec<String>, last: bool) -> Processed {
-        let mut frames = Vec::with_capacity(window.len() as usize);
-        let mut trailing = Vec::new();
-        OPENED.with(|opened| {
-            let mut borrowed = opened.borrow_mut();
-            let opened = borrowed
-                .as_mut()
-                .expect("init loads the graph before any frame arrives");
-            for i in 0..window.len() {
-                let pts = window.pts(i);
-                let rows_in = window.rows(i);
-                let frame = window.fetch(i);
-                // `process` has no way to say no, so a graph that failed
-                // mid-stream stops the run rather than writing a vector that
-                // describes nothing.
-                let rows = step(opened, pts, &rows_in, &frame)
-                    .unwrap_or_else(|message| panic!("{message}"));
-                frames.push(OutFrame {
-                    pts,
-                    frame: FramePayload::Same,
-                    rows,
-                });
-            }
-            // The last call carries no frame - window and stride are 1, so
-            // none is ever left over - and the final shot's row has nothing
-            // to ride.
-            if last {
-                if let Some(segment) = opened.segment.take() {
-                    trailing.push(close(opened, segment).unwrap_or_else(|m| panic!("{m}")));
-                }
-            }
-        });
-        Processed { frames, trailing }
-    }
 }
 
-export!(Clips);
+ffrwd_node::export!(Clips);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffrwd_node::{Clock, Kind, Pairing, Runner};
+
+    #[test]
+    fn the_shots_leave_as_rows_alone_and_the_cuts_are_optional() {
+        let bound = ["v".to_owned(), "cuts".to_owned()];
+        let shape = Runner::<Clips>::shape("", &bound).expect("a shape");
+        assert_eq!(shape.clock, Some(Clock::Input("v".to_owned())));
+        let cuts = shape.find_input("cuts").expect("a cuts port");
+        assert_eq!(cuts.kind, Kind::Data);
+        assert!(!cuts.required);
+        assert_eq!(cuts.pairing, Pairing::Lockstep);
+        assert!(cuts.schema.as_deref().is_some_and(|s| s.contains("shot")));
+        assert_eq!(shape.outputs.len(), 1, "no picture leaves");
+        let shots = &shape.outputs[0];
+        assert_eq!(shots.name, "shots");
+        assert_eq!(shots.time_base, Some(Rational::new(1, 1_000_000)));
+        assert!(shots.latency > CAP, "a row leaves a frame past the cap");
+        assert!(!shape.pure, "the reservoir and the shot running carry over");
+        assert!(Runner::<Clips>::shape("", &["v".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn params_are_refused_because_there_are_none() {
+        let error = Runner::<Clips>::shape(r#"{"threshold":9}"#, &["v".to_owned()])
+            .expect_err("no params exist");
+        assert!(error.contains("threshold"), "{error}");
+    }
 
     #[test]
     fn the_time_base_field_becomes_seconds_per_tick() {
-        assert!((seconds_per_tick(Rational { num: 1, den: 15360 }) * 15360.0 - 1.0).abs() < 1e-12);
-        assert!(
-            (seconds_per_tick(Rational {
-                num: 1001,
-                den: 30000
-            }) * 30000.0
-                - 1001.0)
-                .abs()
-                < 1e-9
+        assert!((seconds_per_tick(Rational::new(1, 15360)) * 15360.0 - 1.0).abs() < 1e-12);
+        assert!((seconds_per_tick(Rational::new(1001, 30000)) * 30000.0 - 1001.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_tv_range_picture_reaches_the_tower_at_full_contrast() {
+        let tv = Arrives::Yuv420p(
+            colour(Some(&ffrwd_node::ColorInfo {
+                range: "tv".to_owned(),
+                primaries: "bt709".to_owned(),
+                trc: "bt709".to_owned(),
+                space: "bt709".to_owned(),
+            }))
+            .expect("tv 709"),
         );
-    }
-
-    #[test]
-    fn a_vector_comes_out_of_the_tower_at_unit_length() {
-        let vector = normalize(vec![3.0, 4.0]);
-        assert!((vector[0] - 0.6).abs() < 1e-6);
-        assert!((vector[1] - 0.8).abs() < 1e-6);
-        let length: f32 = normalize(vec![1.0; EMBEDDING]).iter().map(|v| v * v).sum();
-        assert!((length - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn a_vector_with_no_direction_is_left_alone() {
-        assert_eq!(normalize(vec![0.0; 4]), vec![0.0; 4]);
-    }
-
-    #[test]
-    fn floats_survive_the_round_trip_through_a_tensors_bytes() {
-        let values = vec![0.0f32, -1.5, 1e-8, 3.25];
-        assert_eq!(le_f32s(&le_bytes(&values)), values);
+        let (width, height) = (64usize, 48usize);
+        let mut white = vec![128u8; Yuv420p::size(width, height)];
+        white[..width * height].fill(235);
+        let mut scratch = vec![0u8; width * height * 4];
+        let tensor = tensor_of(tv, &white, &mut scratch, width, height).expect("converts");
+        let full = (1.0 - 0.485) / 0.229;
+        assert!(
+            (tensor[0] - full).abs() < 1e-4,
+            "235 is white: {}",
+            tensor[0]
+        );
     }
 
     #[test]
@@ -512,23 +448,9 @@ mod tests {
     }
 
     #[test]
-    fn params_are_refused_because_there_are_none() {
-        assert!(validate_params("").is_ok());
-        assert!(validate_params("{}").is_ok());
-        let error = validate_params(r#"{"threshold":9}"#).expect_err("no params exist");
-        assert!(error.contains("clips takes no params"), "{error}");
-    }
-
-    #[test]
-    fn a_shot_row_is_read_and_a_row_shaped_any_other_way_is_not() {
-        assert_eq!(shot_of(&[r#"{"shot":3}"#.to_string()]), Some(3));
-        assert_eq!(shot_of(&[r#"{"start_t":0,"end_t":1}"#.to_string()]), None);
-        assert_eq!(shot_of(&[]), None);
-        assert_eq!(
-            shot_of(&[r#"{"shot":1}"#.to_string(), r#"{"shot":2}"#.to_string()]),
-            Some(2),
-            "the last shot row a frame carries is the one that counts"
-        );
+    fn a_cut_row_reads_its_shot_and_lets_a_producers_other_fields_pass() {
+        let cut: Cut = ffrwd_node::parse(r#"{"start_t":1.5,"shot":3}"#).expect("a cut");
+        assert_eq!(cut.shot, 3);
     }
 
     #[test]

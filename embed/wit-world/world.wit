@@ -1,19 +1,8 @@
 package ffrwd:embed;
 
-/// A sentence embedder (all-MiniLM-L6-v2), reached two ways: `embed-text`
-/// as a value function, one prompt in and one 384-d vector out, and
-/// `embed` as a rows module, running the same model over a cue row's
-/// `text` field. It exports both interfaces, the way `ffrwd:fauxlate`
-/// does, and additionally imports `wasi:nn` - the standard interface, not
-/// anything of ours - since both exports run the same graph. It imports no
-/// filesystem: the graph file is the host's, and this module only knows
-/// the name it was bound to.
+/// What `embed` exports beside its node: `embed_text`, the same model over
+/// one prompt, as a value function. `wasi:nn` comes in through the common
+/// crate's world.
 world embed {
-  export ffrwd:av/values@0.14.0;
-  export ffrwd:av/rows-module@0.14.0;
-
-  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
-  import wasi:nn/graph@0.2.0-rc-2024-10-28;
-  import wasi:nn/inference@0.2.0-rc-2024-10-28;
-  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  export ffrwd:av/values@0.19.0;
 }

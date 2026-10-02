@@ -10,12 +10,33 @@ not this package's job - it composes
 and [`ffrwd/vad`](https://github.com/imbcmdth/ffrwd-package-vad)
 instead of shipping a third model for it.
 
+Requires ffrwd 0.29.
+
 The four modules are built and run:
 `target/wasm32-wasip2/release/{clips,sounds,embed,embed_clip}.wasm`, all
-against the `ffrwd:av@0.14.0` world, which is the one `ffrwd/wasm` 0.14.0
-carries. Everything else this package needs is in the registry too, so
-`ffrwd install` is the whole of the setup. Weaving wants ffrwd 0.18.0 or
-newer, which is what hosts a packet filter.
+nodes of the `ffrwd:av@0.19.0` world. `ffrwd install` is the whole of the
+setup.
+
+## The functions
+
+- `clips(v, cuts => <rows>)` returns
+  `STRUCT(start_t number, end_t number, vector vector)[]`: a row a shot,
+  or a row every ten seconds of a longer one, each leaving when its
+  stretch ends. `cuts` is a `{shot}` row a frame from a detector over the
+  same picture, `ffrwd.shots.simple_detector(v)`; left out, the whole
+  input is one shot. No picture leaves.
+- `sounds(a, threshold DEFAULT 0.3, top DEFAULT 3)` returns `cue[]`: up
+  to `top` AudioSet labels a ten-second window, windows half a window
+  apart, each leaving with its window. No sound leaves.
+- `embed(rows)` and `embed_clip(rows)` read cues and write
+  `STRUCT(start_t number, end_t number, vector vector)[]`, a vector a
+  cue at the cue's own time. `embed_text(prompt)` and
+  `embed_clip_text(prompt)` are the same models over one prompt, at
+  compile time, from the same module files.
+
+A reader takes the picture and the sound from the source, and the rows
+from the call:
+`ffrwd.describe.clips(f.video[1], ffrwd.shots.simple_detector(f.video[1]))`.
 
 ## Where the vectors go
 
@@ -28,8 +49,8 @@ changes for a caller:
 - The destination is any container, not an `.mkv`. MP4 takes the same query.
 - A described file survives `-c copy`, a `-ss` cut and a `UNION ALL`, which
   the track never did.
-- `find.sql` reads the vectors back with `ffrwd.index.records`, a packet
-  sink the compiler runs while the query compiles. It copies the keyframes
+- `find.sql` reads the vectors back with `ffrwd.index.records`, a sink
+  the compiler runs while the query compiles. It copies the keyframes
   alone: on the file below, 0.19% of the bytes.
 - Nothing about the file is ffrwd's. The format is
   [SPEC.md](https://github.com/imbcmdth/ffrwd-package-index/blob/main/SPEC.md),
@@ -114,8 +135,9 @@ for.
 
 ### The three spaces
 
-`describe` declares and weaves three, one per rows argument of `weave`, and
-the argument's own name is what puts a row in a space.
+`describe` declares and weaves three. `weave` has an input per declared
+space, named for it, and the call binds each producer to its space by
+name: `clip => ..., sound => ..., speech => ...`.
 
 | space | modality | dims | model | query |
 | --- | --- | --- | --- | --- |
@@ -139,10 +161,15 @@ it does not have.
 `describe` stream-copies the audio. The packets in the output are the
 source's own bytes, the codec is the source's codec, and the file is the
 source's size plus what the records cost. That holds even though `sounds`
-and `vad` read the same audio on the way past and even though the video
-carries a packet filter: ffrwd opens the source again for the stream it is
-copying rather than taking it off the pipe those two modules read. That is
-ffrwd 0.18.0's behaviour and one more reason this package asks for it.
+and `vad` read the same audio on the way past: ffrwd opens the source again
+for the stream it is copying rather than taking it off the pipe those two
+modules read.
+
+### Each model runs once
+
+The labels and the transcript are read twice, as caption tracks and under
+`embed`, and each is one node: a call written twice in one query is one
+call, and its rows go to both readers.
 
 ### Which space is which
 
@@ -264,13 +291,15 @@ For a contributor with the checkout. An installed copy of the package needs
 none of this: the four modules travel in the archive.
 
 ```
-ffrwd install
 cargo build --target wasm32-wasip2 --release
+cargo test
 ```
 
-The install is what puts `ffrwd/wasm` where each module's `build.rs` can
-find it: the script asks `ffrwd path ffrwd/wasm` and copies the `ffrwd:av`
-wit out of the package, at the version the manifest pins.
+Every module is a node written with
+[`ffrwd-node`](https://github.com/imbcmdth/ffrwd-node), which carries the
+world it is built against, and `common/` is the `wasi:nn` glue the four
+share. `embed` and `embed_clip` also export `values`, on bindings of their
+own built from `wit/av.wit`, a copy of the same world.
 
 The X-CLIP ONNX export under `build/xclip` is `scripts/export_xclip.py`'s
 output, pinned to the revision the manifest names.

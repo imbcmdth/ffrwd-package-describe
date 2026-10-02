@@ -45,17 +45,18 @@ impl Default for Reservoir {
 impl Reservoir {
     /// Offers the shot's next frame. `preprocess` runs only for the frames
     /// the reservoir keeps, so a long shot pays for one frame in `stride`.
-    pub fn offer(&mut self, preprocess: impl FnOnce() -> Vec<f32>) {
+    pub fn offer<E>(&mut self, preprocess: impl FnOnce() -> Result<Vec<f32>, E>) -> Result<(), E> {
         if self.seen.is_multiple_of(self.stride) {
             self.kept.push(Kept {
                 index: self.seen,
-                tensor: preprocess(),
+                tensor: preprocess()?,
             });
             if self.kept.len() > CAPACITY {
                 self.thin();
             }
         }
         self.seen += 1;
+        Ok(())
     }
 
     /// Every second frame dropped and the stride doubled, which leaves what
@@ -128,7 +129,9 @@ mod tests {
     fn fed(count: usize) -> Reservoir {
         let mut reservoir = Reservoir::default();
         for i in 0..count {
-            reservoir.offer(|| vec![i as f32]);
+            reservoir
+                .offer(|| Ok::<_, ()>(vec![i as f32]))
+                .expect("offered");
         }
         reservoir
     }

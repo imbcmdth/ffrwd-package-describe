@@ -1,10 +1,10 @@
 //! A sentence embedder, reached two ways.
 //!
 //! `embed_text` is a value function: one prompt in, one 384-d vector out,
-//! computed at compile time like any other value call. `embed` is a rows
-//! module: it reads whatever produced its `cue[]` argument - sounds's
-//! labels, or a transcript's words, either shape - and writes one vector
-//! beside each row, no stream involved. Both tokenize their text the same
+//! computed at compile time like any other value call. `embed` is a node
+//! clocked by its rows: it reads whatever produced its `cue[]` argument
+//! (sounds's labels, or a transcript's words, either shape) and writes one
+//! vector a row on `vectors`, at the row's own time, no stream involved. Both tokenize their text the same
 //! way and run the same graph; the manifest pins the one ONNX file both
 //! load, under the export name `embed`.
 //!
@@ -36,12 +36,10 @@
 //! vector, weighted by the attention mask the same way sentence-transformers
 //! itself pools this model's output.
 
-// `generate_all`: the world's interfaces come from two other packages -
-// ffrwd:av and wasi:nn - and without it bindgen expects them to have been
-// generated somewhere else.
+// The values export rides on bindings of its own beside the node ffrwd-node
+// exports; `../wit` is ffrwd:av@0.19.0 as the SDK carries it, byte for byte.
 wit_bindgen::generate!({
-    path: ["wit", "wit-world"],
-    // Fully qualified: three packages are in scope, and each has worlds.
+    path: ["../wit", "wit-world"],
     world: "ffrwd:embed/embed",
     generate_all,
 });
@@ -49,14 +47,13 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
-use exports::ffrwd::av::rows_module::{Guest as RowsGuest, RowsModuleMeta};
+use describe_common::{le_f32s, normalize, Element, Feed, Model};
 use exports::ffrwd::av::values::{FunctionMeta, Guest as ValuesGuest};
-use ffrwd::av::types::Meta;
+use ffrwd_node::{
+    Bound, Init, Input, NoParams, Node, Out, Output, Result as NodeResult, Shape, Tick,
+};
 use serde::{Deserialize, Serialize};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
-use wasi::nn::graph::{load_by_name, Graph};
-use wasi::nn::inference::GraphExecutionContext;
-use wasi::nn::tensor::{Tensor, TensorType};
 
 /// The name the host binds the graph to: `-nn embed=<path>`.
 const MODEL: &str = "embed";
@@ -158,65 +155,6 @@ fn tokenize(text: &str) -> Result<Tokenized, String> {
     })
 }
 
-/// The spec's spelling of an error code, so a message says what actually
-/// went wrong rather than how this module happens to format things.
-fn failed(what: &str, error: &wasi::nn::errors::Error) -> String {
-    use wasi::nn::errors::ErrorCode;
-    let code = match error.code() {
-        ErrorCode::InvalidArgument => "invalid-argument",
-        ErrorCode::InvalidEncoding => "invalid-encoding",
-        ErrorCode::Timeout => "timeout",
-        ErrorCode::RuntimeError => "runtime-error",
-        ErrorCode::UnsupportedOperation => "unsupported-operation",
-        ErrorCode::TooLarge => "too-large",
-        ErrorCode::NotFound => "not-found",
-        ErrorCode::Security => "security",
-        ErrorCode::Unknown => "unknown",
-    };
-    format!("embed: {what}: {code} ({})", error.data())
-}
-
-/// The graph and its execution context, built once per instance and kept
-/// for every call after - the first call is what a provider picks its
-/// kernels on, and every call after it reuses them. The graph is kept
-/// alive alongside its context, which is only valid while the graph is.
-struct Nn {
-    context: GraphExecutionContext,
-    _graph: Graph,
-}
-
-thread_local! {
-    static NN: RefCell<Option<Nn>> = const { RefCell::new(None) };
-}
-
-/// Loads the graph if this instance has not already, then runs `f` against
-/// its context.
-fn with_context<T>(
-    f: impl FnOnce(&GraphExecutionContext) -> Result<T, String>,
-) -> Result<T, String> {
-    NN.with(|cell| {
-        let mut opened = cell.borrow_mut();
-        if opened.is_none() {
-            let graph =
-                load_by_name(MODEL).map_err(|e| failed(&format!("load-by-name({MODEL:?})"), &e))?;
-            let context = graph
-                .init_execution_context()
-                .map_err(|e| failed("init-execution-context", &e))?;
-            *opened = Some(Nn {
-                context,
-                _graph: graph,
-            });
-        }
-        f(&opened.as_ref().expect("just filled").context)
-    })
-}
-
-/// A tensor's floats, out of the little-endian bytes it arrived as.
-fn le_f32s(data: &[u8]) -> Vec<f32> {
-    let (whole, _) = data.as_chunks::<4>();
-    whole.iter().copied().map(f32::from_le_bytes).collect()
-}
-
 /// The named tensor's bytes out of what a compute answered, checked against
 /// the element count its shape fixes. Takes plain bytes rather than the
 /// wit-bindgen `Tensor` resource - `run_model` converts immediately after
@@ -248,35 +186,28 @@ fn take_output(
 
 /// One tokenized prompt through the graph: `last_hidden_state`, one
 /// `VECTOR_LEN`-wide row per token, flattened token-major.
-fn run_model(ids: &[i64], mask: &[i64], type_ids: &[i64]) -> Result<Vec<f32>, String> {
-    let seq_len = ids.len() as u32;
-    let dims = [1, seq_len];
+fn run_model(
+    model: &Model,
+    ids: &[i64],
+    mask: &[i64],
+    type_ids: &[i64],
+) -> Result<Vec<f32>, String> {
+    let dims = [1, ids.len() as u32];
     let ids_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mask_bytes: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
     let type_bytes: Vec<u8> = type_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-    with_context(|context| {
-        let inputs = vec![
-            (
-                INPUT_IDS.to_string(),
-                Tensor::new(&dims, TensorType::I64, &ids_bytes),
-            ),
-            (
-                ATTENTION_MASK.to_string(),
-                Tensor::new(&dims, TensorType::I64, &mask_bytes),
-            ),
-            (
-                TOKEN_TYPE_IDS.to_string(),
-                Tensor::new(&dims, TensorType::I64, &type_bytes),
-            ),
-        ];
-        let outputs = context.compute(inputs).map_err(|e| failed("compute", &e))?;
-        let outputs: Vec<(String, Vec<u8>)> = outputs
-            .into_iter()
-            .map(|(name, tensor)| (name, tensor.data()))
-            .collect();
-        take_output(outputs, OUTPUT_NAME, ids.len() * VECTOR_LEN)
-    })
+    let feed = |name, data| Feed {
+        name,
+        dimensions: &dims,
+        element: Element::I64,
+        data,
+    };
+    let outputs = model.run(&[
+        feed(INPUT_IDS, &ids_bytes),
+        feed(ATTENTION_MASK, &mask_bytes),
+        feed(TOKEN_TYPE_IDS, &type_bytes),
+    ])?;
+    take_output(outputs, OUTPUT_NAME, ids.len() * VECTOR_LEN)
 }
 
 /// `last_hidden_state`'s `seq_len` rows of `VECTOR_LEN` floats each,
@@ -306,32 +237,18 @@ fn mean_pool(hidden: &[f32], mask: &[i64], seq_len: usize) -> Vec<f32> {
     pooled
 }
 
-/// `vector` divided by its own L2 norm, so `cos_similarity` between any two
-/// of these is a plain dot product. A zero vector - which a trained model
-/// never actually produces - is returned as is rather than manufacturing a
-/// direction from nothing.
-fn l2_normalize(mut vector: Vec<f32>) -> Vec<f32> {
-    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for v in &mut vector {
-            *v /= norm;
-        }
-    }
-    vector
-}
-
 /// One prompt or row's text, tokenized, run through the model, pooled and
 /// normalized. `on_truncated` is called when the text ran past
 /// `MAX_TOKENS`, so each caller can say what it was that got cut.
-fn embed(text: &str, on_truncated: impl FnOnce()) -> Result<Vec<f32>, String> {
+fn embed(model: &Model, text: &str, on_truncated: impl FnOnce()) -> Result<Vec<f32>, String> {
     let tokenized = tokenize(text)?;
     if tokenized.truncated {
         on_truncated();
     }
     let seq_len = tokenized.ids.len();
-    let hidden = run_model(&tokenized.ids, &tokenized.mask, &tokenized.type_ids)?;
+    let hidden = run_model(model, &tokenized.ids, &tokenized.mask, &tokenized.type_ids)?;
     let pooled = mean_pool(&hidden, &tokenized.mask, seq_len);
-    Ok(l2_normalize(pooled))
+    Ok(normalize(pooled))
 }
 
 const EMBED_TEXT: &str = "embed_text";
@@ -350,8 +267,6 @@ fn extract_string_arg(name: &str, args: &str, field: &str) -> Result<String, Str
         .ok_or_else(|| format!("{name}: args must be an object with a string \"{field}\""))
 }
 
-const ROWS_PARAMS_SCHEMA: &str =
-    r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 /// What `process` reads: a cue-shaped row, extra keys ignored - the same
 /// shape `sounds`'s labels and a transcript's words both take.
 const INPUT_ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"start_t":{"type":"number"},"end_t":{"type":"number"},"text":{"type":"string"}},"required":["start_t","end_t","text"],"additionalProperties":true}"#;
@@ -375,34 +290,30 @@ struct OutRow {
     vector: Vec<f32>,
 }
 
-/// This module takes no parameters: the model and its tokenizer are fixed.
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("embed takes no params, got: {other}")),
-    }
-}
-
-fn process_row(row: &str) -> Result<String, String> {
+fn process_row(model: &Model, row: &str) -> Result<OutRow, String> {
     let cue: InCue =
         serde_json::from_str(row).map_err(|e| format!("embed: {row}: not a cue: {e}"))?;
     let start_t = cue.start_t;
-    let vector = embed(&cue.text, || {
+    let vector = embed(model, &cue.text, || {
         eprintln!(
             "embed: row at start_t={start_t}: text ran past {MAX_TOKENS} tokens and was truncated"
         );
     })?;
-    serde_json::to_string(&OutRow {
+    Ok(OutRow {
         start_t: cue.start_t,
         end_t: cue.end_t,
         vector,
     })
-    .map_err(|e| format!("embed: serializing a row: {e}"))
 }
 
-struct Embed;
+thread_local! {
+    /// The graph a value call runs, loaded by the first one.
+    static VALUES_MODEL: RefCell<Option<Model>> = const { RefCell::new(None) };
+}
 
-impl ValuesGuest for Embed {
+struct EmbedText;
+
+impl ValuesGuest for EmbedText {
     fn list_functions() -> Vec<FunctionMeta> {
         vec![FunctionMeta {
             name: EMBED_TEXT.to_string(),
@@ -415,10 +326,17 @@ impl ValuesGuest for Embed {
         match name.as_str() {
             EMBED_TEXT => {
                 let prompt = extract_string_arg(EMBED_TEXT, &args, "prompt")?;
-                let vector = embed(&prompt, || {
-                    eprintln!(
-                        "embed_text: prompt ran past {MAX_TOKENS} tokens and was truncated: {prompt:?}"
-                    );
+                let vector = VALUES_MODEL.with(|cell| {
+                    let mut model = cell.borrow_mut();
+                    if model.is_none() {
+                        *model = Some(Model::load("embed_text", MODEL)?);
+                    }
+                    let model = model.as_ref().expect("just loaded");
+                    embed(model, &prompt, || {
+                        eprintln!(
+                            "embed_text: prompt ran past {MAX_TOKENS} tokens and was truncated: {prompt:?}"
+                        );
+                    })
                 })?;
                 serde_json::to_string(&vector)
                     .map_err(|e| format!("{EMBED_TEXT}: serializing result: {e}"))
@@ -430,43 +348,44 @@ impl ValuesGuest for Embed {
     }
 }
 
-impl RowsGuest for Embed {
-    fn describe() -> RowsModuleMeta {
-        RowsModuleMeta {
-            meta: Meta {
-                name: "embed".to_string(),
-                version: "0.1.0".to_string(),
-                params_schema: ROWS_PARAMS_SCHEMA.to_string(),
-                rows_schema: OUTPUT_ROWS_SCHEMA.to_string(),
-                pixel_formats: Vec::new(),
-                sample_formats: Vec::new(),
-                sample_rates: Vec::new(),
-                channel_counts: Vec::new(),
-                rows_language: Vec::new(),
-            },
-            input_rows_schema: INPUT_ROWS_SCHEMA.to_string(),
+export!(EmbedText);
+
+struct Embed {
+    rows: u32,
+    model: Model,
+}
+
+impl Node for Embed {
+    const NAME: &'static str = "embed";
+    const VERSION: &'static str = "0.2.0";
+    type Params = NoParams;
+
+    fn shape(_: &NoParams, _: &Bound) -> NodeResult<Shape> {
+        Ok(Shape::new()
+            .input(Input::rows("rows").clock().schema_json(INPUT_ROWS_SCHEMA))
+            .output(Output::rows("vectors").schema_json(OUTPUT_ROWS_SCHEMA))
+            .pure())
+    }
+
+    fn init(_: NoParams, init: &Init) -> NodeResult<Embed> {
+        Ok(Embed {
+            rows: init.stream("rows")?.id,
+            // Loaded here, so a run missing `-nn embed=<path>` is refused
+            // before any row is read.
+            model: Model::load("embed", MODEL)?,
+        })
+    }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> NodeResult<()> {
+        for message in tick.messages(self.rows) {
+            let row = String::from_utf8_lossy(&message.data);
+            out.row("vectors", message.pts, &process_row(&self.model, &row)?)?;
         }
-    }
-
-    fn init(params: String) -> Result<(), String> {
-        validate_params(&params)?;
-        // Fail fast: a run missing `-nn embed=<path>` is refused here,
-        // before any row is read, rather than on the first `process` call.
-        with_context(|_| Ok(()))
-    }
-
-    fn process(rows: Vec<String>) -> Result<Vec<String>, String> {
-        rows.iter().map(|row| process_row(row)).collect()
-    }
-
-    fn finish() -> Result<Vec<String>, String> {
-        // Every row is embedded and emitted the moment `process` sees it;
-        // nothing is held back for a final call to release.
-        Ok(Vec::new())
+        Ok(())
     }
 }
 
-export!(Embed);
+ffrwd_node::export!(Embed);
 
 #[cfg(test)]
 mod tests {
@@ -543,45 +462,24 @@ mod tests {
         assert!(pooled.iter().all(|&v| v == 0.0));
     }
 
-    fn cosine(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-        let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
-        dot / (na * nb)
-    }
-
     #[test]
-    fn l2_normalize_produces_a_unit_vector() {
-        let v = l2_normalize(vec![3.0, 4.0]);
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-6, "norm = {norm}");
-        assert!((v[0] - 0.6).abs() < 1e-6);
-        assert!((v[1] - 0.8).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_zero_vector_stays_zero() {
-        assert_eq!(l2_normalize(vec![0.0, 0.0, 0.0]), vec![0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn normalizing_does_not_change_direction() {
-        let a = l2_normalize(vec![1.0, 2.0, 2.0]);
-        let b = l2_normalize(vec![2.0, 4.0, 4.0]);
-        assert!(
-            (cosine(&a, &b) - 1.0).abs() < 1e-6,
-            "same direction, different length, should agree exactly"
-        );
+    fn rows_clock_the_node_and_vectors_leave_with_them() {
+        use ffrwd_node::{Clock, Kind, Runner};
+        let shape = Runner::<Embed>::shape("", &["rows".to_owned()]).expect("a shape");
+        assert_eq!(shape.clock, Some(Clock::Input("rows".to_owned())));
+        assert_eq!(shape.inputs[0].kind, Kind::Data);
+        let vectors = &shape.outputs[0];
+        assert_eq!((vectors.name.as_str(), vectors.latency), ("vectors", 0.0));
+        assert!(shape.pure);
     }
 
     #[test]
     fn no_params_is_accepted_and_anything_else_is_refused() {
-        assert!(validate_params("").is_ok());
-        assert!(validate_params("{}").is_ok());
-        let Err(err) = validate_params(r#"{"lang":"es"}"#) else {
-            panic!("embed takes no params and should refuse one");
-        };
-        assert!(err.contains("no params"), "got: {err}");
+        use ffrwd_node::Runner;
+        let bound = ["rows".to_owned()];
+        assert!(Runner::<Embed>::shape("{}", &bound).is_ok());
+        let error = Runner::<Embed>::shape(r#"{"lang":"es"}"#, &bound).expect_err("no params");
+        assert!(error.contains("lang"), "got: {error}");
     }
 
     #[test]

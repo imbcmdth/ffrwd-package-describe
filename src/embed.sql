@@ -8,10 +8,11 @@
 -- not sentences, so it is kept apart rather than used as the default row
 -- embedder.
 --
--- The rows form reads whatever produced its cue[] argument, and writes one
--- vector beside each row, no stream involved. The value form takes one
--- prompt and returns one vector, computed at compile time like any other
--- value call.
+-- The rows form reads whatever produced its cue[] argument and writes one
+-- vector a row, at the row's own time, no stream involved. The value form
+-- takes one prompt and returns one vector, computed at compile time like
+-- any other value call. Both live in one module file, so the two run the
+-- same graph.
 CREATE FUNCTION embed(rows cue[])
 RETURNS STRUCT(start_t number, end_t number, vector vector)[]
   AS 'target/wasm32-wasip2/release/embed.wasm', 'embed' LANGUAGE wasm;

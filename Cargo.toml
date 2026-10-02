@@ -1,7 +1,10 @@
 [workspace]
-# The wasm module this crate builds. It builds into
-# target/wasm32-wasip2/release/, which is where src/embed.sql names it.
+# The wasm modules this package ships. They build into
+# target/wasm32-wasip2/release/, which is where the lib SQL names them.
+# `common` is shared Rust the modules compile in; it ships nothing of its
+# own.
 members = [
+    "common",
     "clips",
     "embed",
     "embed_clip",

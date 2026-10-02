@@ -1,0 +1,831 @@
+// ffrwd:av 0.19.0: the node world.
+//
+// A node has any number of typed input ports, any number of typed output
+// ports, and a clock. One tick of the clock is one `process` call: the host
+// assembles what every input holds for that tick, the node emits on its
+// outputs. A frame's bytes cross into the module only on `fetch`.
+//
+// `types`, `values`, `encoder` and `decoder` carry on from 0.18.0. Every
+// other 0.18.0 interface is frozen in worlds/0.18.0 and adapted onto `node`
+// by the host.
+
+package ffrwd:av@0.19.0;
+
+interface types {
+  /// Static description of a module, available without running anything.
+  record meta {
+    name: string,
+    version: string,
+    /// JSON Schema for the `params` string.
+    params-schema: string,
+    /// JSON Schema for one row object; empty when the module emits none.
+    rows-schema: string,
+    /// Pixel formats accepted, most preferred first. Empty means this is not
+    /// a video module.
+    pixel-formats: list<string>,
+    /// Sample formats accepted, most preferred first: "f32" or "s16", always
+    /// interleaved. Empty means this is not an audio module. A module is one
+    /// kind or the other, so exactly one of this and `pixel-formats` is
+    /// filled in.
+    sample-formats: list<string>,
+    /// Sample rates accepted. Empty is every rate.
+    sample-rates: list<u32>,
+    /// Channel counts accepted. Empty is every count.
+    channel-counts: list<u32>,
+    /// Ordered param names; the module's rows' language is the first of these
+    /// params that is set at the call; empty list = none declared.
+    rows-language: list<string>,
+  }
+
+  /// A ratio of two whole numbers.
+  record rational {
+    num: s32,
+    den: s32,
+  }
+
+  /// A stream's colorimetry, in ffmpeg's own names: "tv" or "pc" for the
+  /// range, "bt709" and the like for the rest. A field the wire does not
+  /// settle is "unknown", ffmpeg's own spelling for it.
+  record color-info {
+    range: string,
+    primaries: string,
+    trc: string,
+    space: string,
+  }
+
+  /// The frames of a video instance, fixed for the life of the instance.
+  /// Frames cross this boundary square-pixel: the host rescales anamorphic
+  /// input before it arrives, so no aspect ratio is carried here.
+  record video-format {
+    width: u32,
+    height: u32,
+    pix-fmt: string,
+    /// The colorimetry the stream header declared; none where it did not.
+    color: option<color-info>,
+  }
+
+  /// The samples of an audio instance, fixed for the life of the instance.
+  record audio-format {
+    sample-rate: u32,
+    channels: u32,
+    /// "f32" or "s16", interleaved.
+    sample-fmt: string,
+    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
+    /// count alone cannot say; none where the wire does not carry one.
+    channel-layout: option<string>,
+  }
+
+  /// What an instance is opened for, which is what tells its kind. A module
+  /// is handed the arm its own declaration asked for; the host refuses the
+  /// other one before `init`.
+  variant format {
+    video(video-format),
+    audio(audio-format),
+  }
+
+  /// The stream an instance is attached to, told once at init.
+  record stream-info {
+    index: u32,
+    kind: string,
+    codec: string,
+    /// Seconds; absent when unknown.
+    duration: option<f64>,
+    /// The stream's own tags.
+    tags: list<tuple<string, string>>,
+    /// The unit timestamps are counted in, as a fraction of a second. The host
+    /// always supplies it; `den` is always positive. A windowed module is
+    /// handed timestamps rather than seconds, so this is how one whose
+    /// parameters are in seconds converts them. For audio it is what turns a
+    /// sample position into a timestamp: at 1/48000 one tick is one sample.
+    time-base: rational,
+  }
+
+  /// The frames a coded video stream declares. Shared between `packet-sink`
+  /// and `packet-source`.
+  record coded-video {
+    width: u32,
+    height: u32,
+    /// The pixel aspect ratio the stream declares. Packets cannot be
+    /// host-rescaled, so a packager writes it through (mp4's `pasp`);
+    /// none where the wire does not say.
+    sample-aspect-ratio: option<rational>,
+    /// The colorimetry the stream header declared; none where it did not.
+    color: option<color-info>,
+  }
+
+  /// The samples a coded audio stream declares.
+  record coded-audio {
+    sample-rate: u32,
+    channels: u32,
+    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
+    /// count alone cannot say; none where the wire does not carry one.
+    channel-layout: option<string>,
+  }
+
+  /// What a coded stream carries, which is what tells its kind.
+  variant coded-format {
+    video(coded-video),
+    audio(coded-audio),
+    /// A data stream: messages rather than pictures or sound, each packet
+    /// one message at its own pts. For codec "json" a message is one UTF-8
+    /// JSON object. It has no geometry, and every packet is a keyframe.
+    data,
+  }
+
+  /// One encoded stream an instance is opened for, fixed for its life.
+  record coded-stream {
+    /// ffmpeg's name for the codec, e.g. "h264".
+    codec: string,
+    /// The unit `pts` and `dts` are counted in, as a fraction of a second.
+    time-base: rational,
+    /// The geometry the stream declares, and its kind.
+    format: coded-format,
+    /// The codec's out-of-band header, exactly as the stream header carried
+    /// it: for h264, the SPS and PPS a downstream packager needs before the
+    /// first packet.
+    extradata: list<u8>,
+    /// The codec's profile, in the codec's own numbering - what ffmpeg's
+    /// codec parameters carry; none where the wire does not say.
+    profile: option<s32>,
+    /// The codec's level, likewise.
+    level: option<s32>,
+  }
+
+  /// One encoded packet, exactly as the encoder emitted it.
+  record packet {
+    /// When the picture is presented, in the stream's time base. Packets
+    /// arrive in decode order, so where the stream reorders frames this is
+    /// not monotonic.
+    pts: s64,
+    /// When the packet is decoded; never decreasing. Absent for the first
+    /// packets of a reordering stream, where the wire does not settle it.
+    dts: option<s64>,
+    /// How long the packet is presented, in the stream's time base: the
+    /// next packet's pts minus this one's, in presentation order. None
+    /// where the wire does not settle it - unknown is never spelled 0.
+    duration: option<s64>,
+    /// Whether decoding can start at this packet.
+    keyframe: bool,
+    /// The encoded bytes, untouched.
+    data: list<u8>,
+  }
+
+  /// One raw frame crossing a codec: a video frame's pixels in the
+  /// instance's pix-fmt, or a run of interleaved audio samples in its
+  /// sample-fmt. What a codec and a node hand over.
+  record raw-frame {
+    /// When it is presented, in the stream's time base.
+    pts: s64,
+    /// How long it is presented, in the stream's time base; none where
+    /// nothing settles it - unknown is never spelled 0.
+    duration: option<s64>,
+    data: list<u8>,
+  }
+
+  /// One pad's packets from one call, in decode order. Empty when nothing
+  /// arrived on that pad; a packet sink's list of these is as long as its
+  /// `init`'s streams and in the same order, so the index is the pad.
+  record pad-packets {
+    packets: list<packet>,
+  }
+
+  /// What the source read of one relation row: a rendition's name, bitrate
+  /// and codec string, exactly as the manifest or catalog said them. None
+  /// where nothing said so. Shared between `packet-sink` and
+  /// `packet-source`.
+  record rendition-meta {
+    name: option<string>,
+    bandwidth: option<u64>,
+    codecs: option<string>,
+    language: option<string>,
+  }
+
+  /// How much of a stream a sink has to be handed to do its work. A sink
+  /// that reads what a writer put on keyframes, or what a stream's first
+  /// packet declares, does not need the rest - and a host reading a file to
+  /// answer a question at compile time can copy far less of it.
+  ///
+  /// It is a REQUEST, not a promise: a host may hand over more than was
+  /// asked for, and every sink has to work when it does. What a host may not
+  /// do is hand over less.
+  enum wants {
+    /// Every packet of every stream. What a sink that counts, tallies or
+    /// republishes needs, and what a host with no way to skip hands over.
+    all,
+    /// The keyframes, and whatever else the host could not cheaply drop.
+    /// What a sink reading data a writer placed on keyframes needs.
+    keyframes,
+    /// The first packet of each stream, and no more. What a sink reading
+    /// only what a stream declares about itself needs.
+    first,
+  }
+
+  /// How many streams of one kind a module reading encoded packets takes.
+  /// Shared between `packet-sink` and `packet-filter`.
+  enum arity {
+    /// None of this kind reaches the module.
+    zero,
+    /// Exactly one, which is what every sink before 0.12.0 read.
+    one,
+    /// One or more, as many as the query hands over.
+    many,
+    /// As many as the query hands over, none included: the module reads
+    /// them when they are there and works when they are not.
+    any,
+  }
+
+  /// One pad's stream, told once at init: what the wire's own header said
+  /// about the encoding, and what the process driving the host said about
+  /// the stream. Shared between `packet-sink` and `packet-filter`.
+  record input-stream {
+    coded: coded-stream,
+    info: stream-info,
+    /// Which relation row this pad belongs to - the moq sink learns
+    /// renditions from the rows instead of from argument names.
+    row: u32,
+    /// What the source read of that row.
+    rendition: rendition-meta,
+    /// How deep this stream reorders: how many packets the decoder holds
+    /// back before the first picture leaves it. 0 where decode order IS
+    /// presentation order, and higher wherever B-frames do.
+    ///
+    /// It is the bound a module that must see packets in PRESENTATION
+    /// order works with: a packet's presentation successor has arrived
+    /// once `decode-delay` more packets have. It is also why `packet.dts`
+    /// is none for a pad's first `decode-delay` packets, which is the wire
+    /// not having settled them rather than the host withholding them.
+    decode-delay: u32,
+  }
+}
+
+interface node-types {
+  use types.{rational, color-info, video-format, audio-format, coded-stream,
+             packet, stream-info, rendition-meta, wants};
+
+  enum port-kind { video, audio, data, packets }
+
+  /// What a node does with the rows that arrive on an input.
+  /// `per-frame`: reads a tick's rows while handling that tick and keeps
+  /// nothing. `state`: folds rows into state later ticks depend on, so a
+  /// frame-parallel instance must also see the rows of the ticks it did not
+  /// process (`earlier-rows`).
+  enum rows-use { ignore, per-frame, state }
+
+  /// How a hold input's offset between source time and clock time is fixed.
+  /// `shared-clock`: the source's pts are on the clock's epoch; offset 0, and
+  /// the host holds the first frame until the clock reaches it (a timed
+  /// feeder). `first-frame`: the offset is fixed once the host holds `lead`
+  /// seconds of the source, or its end, and the start is scheduled `lead`
+  /// seconds ahead of the clock (an untimed feeder). `tagged`: shared-clock
+  /// for a feed whose tags carry this name set to 1, first-frame
+  /// otherwise (the switch's `smart_timed`).
+  variant anchor { shared-clock, first-frame, tagged(string) }
+
+  /// A frame input paired by time: the newest frame at or before the tick.
+  /// The host keeps the source buffered ahead, repeats the last frame while
+  /// the source falls behind, skips forward when it catches up, and reports
+  /// both. What ffrwd/switch did for itself, for any node.
+  record hold {
+    anchor: anchor,
+    /// Seconds ahead of the clock a first-frame start is scheduled.
+    lead: f64,
+    /// Seconds the last frame stays after the source ends; none drops it
+    /// at once.
+    linger: option<f64>,
+    /// Seconds of programme time without a frame before a live source is
+    /// given up on and its feed ended; none waits for it.
+    timeout: option<f64>,
+    /// Hold inputs of one group arrive on one connection from one source
+    /// (a feeder's picture and sound): one offset, fixed by the group's
+    /// first picture, and feed starts and ends on the same tick.
+    group: option<string>,
+    /// The param that carries this input's loopback port. Bound to a
+    /// stream, the host writes the port it picked there; left unbound, the
+    /// host listens on the port the call wrote, and whatever connects is
+    /// the source.
+    port-param: option<string>,
+  }
+
+  /// A message input paired by time: every message whose pts falls in the
+  /// tick's interval, extended by `ahead`, each delivered once at the first
+  /// tick that holds it, held while it is ahead of the clock. The host
+  /// settles the interval once the producer's progress has passed its end
+  /// plus `ahead`; `latency` bounds that wait, and a message later than the
+  /// bound is delivered at the next tick and reported.
+  record interval {
+    /// The most this input waits, in seconds: the interval settles once the
+    /// clock input has arrived this long past its end, progress or not.
+    /// None waits for the producer's progress alone; a producer that sends
+    /// none (a lateral, a data feeder) needs a bound set.
+    latency: option<f64>,
+    /// Seconds past the interval's end whose messages are handed with it,
+    /// for a node that acts before a stamp (a fade in before a cue).
+    ahead: f64,
+  }
+
+  variant pairing {
+    /// The clock's pts exactly: same source, one frame per tick. The input
+    /// `clock` names is declared lockstep.
+    lockstep,
+    /// Frame kinds only.
+    hold(hold),
+    /// Message kinds only.
+    interval(interval),
+    /// Delivered as it arrives, unpaired: packets to a sink, data a node
+    /// orders itself.
+    arrival,
+  }
+
+  /// What an input accepts. Empty lists accept anything of the kind.
+  record accepts {
+    pixel-formats: list<string>,
+    sample-formats: list<string>,
+    sample-rates: list<u32>,
+    channel-counts: list<u32>,
+    codecs: list<string>,
+    wants: wants,
+    /// Conformed by the host to that input's stream: a video to its size,
+    /// an audio to its rate and layout. The named input is single.
+    like: option<string>,
+  }
+
+  record input-port {
+    name: string,
+    kind: port-kind,
+    required: bool,
+    /// Any number of streams bound to this one port, each with its own
+    /// metadata and time base (a publisher's renditions, a weave's rows
+    /// inputs).
+    many: bool,
+    pairing: pairing,
+    rows: rows-use,
+    /// The clock input: frames (video) or samples (audio) a call sees, and
+    /// how many it consumes. Every other input hands the tick's interval
+    /// and declares 1/1.
+    window: u32,
+    stride: u32,
+    accepts: accepts,
+    /// Data inputs: the JSON schema of the rows the node reads here, as
+    /// `rows-module` declared its input rows. None accepts any row.
+    schema: option<string>,
+  }
+
+  /// An input's format with one field overridden: a matte the size of its
+  /// picture, in gray. The named input is single and a frame kind.
+  record like-input {
+    port: string,
+    pixel-format: option<string>,
+    sample-format: option<string>,
+  }
+
+  variant output-format {
+    video(video-format),
+    audio(audio-format),
+    /// The codec, "json" today.
+    data(string),
+    packets(coded-stream),
+    like(like-input),
+  }
+
+  record output-port {
+    name: string,
+    kind: port-kind,
+    /// None: the clock input's format, as most filters leave it.
+    format: option<output-format>,
+    /// None: the clock input's.
+    time-base: option<rational>,
+    /// How far behind the end of its tick's interval a stamp may fall, in
+    /// seconds; 0 when everything leaves with its tick. A window's
+    /// length is not counted here: a recogniser that emits a window's
+    /// results with the window declares 0. Consumers pairing by interval
+    /// and the compiler's delay sums read it.
+    latency: f64,
+    /// Data outputs: the JSON schema of the rows this port writes.
+    schema: option<string>,
+    /// A source read in FROM: the row of `relation` this output belongs
+    /// to. Outputs of one row are one rendition.
+    row: option<u32>,
+  }
+
+  variant clock {
+    input(string),
+    /// A generator: ticks at this rate, paced to real time in a live run
+    /// and as fast as the outputs drain otherwise. For a node with inputs
+    /// that only need turns (a publisher's network session): at least this
+    /// often, and the last call comes once every input has ended, unless
+    /// the node finished first.
+    rate(rational),
+    /// A rate clock at the named input's rate, which the compiler reads
+    /// off that port's first stream; the input itself is held like any
+    /// other. A tile of pictures at the first picture's rate.
+    rate-of(string),
+    /// The node emits when it has something; its outputs' pts are the
+    /// timeline (a network source).
+    self-clocked,
+  }
+
+  record node-shape {
+    inputs: list<input-port>,
+    outputs: list<output-port>,
+    clock: clock,
+    /// Every call depends only on what it was handed, counting a state
+    /// input's earlier rows as handed. A host spreads a pure node over
+    /// workers; an impure one runs as one instance, in order.
+    pure: bool,
+    /// Frame kinds: one frame out per frame in on the clock's outputs, each at
+    /// its tick's pts. Audio: samples conserved and contiguous.
+    one-to-one: bool,
+    /// A rate or self-clocked node: whether it ends by itself. A live one
+    /// does not, and the compiler plans it as live. Ignored on an input
+    /// clock.
+    bounded: bool,
+    /// A source read in FROM: one JSON object per relation row (rendition,
+    /// bandwidth, codecs, geometry), which its outputs name by index.
+    relation: list<string>,
+  }
+
+  /// One stream bound to an input port at `init`.
+  record bound-stream {
+    port: string,
+    /// Names the stream for the instance's life: distinct across the
+    /// bound streams, and what every tick call and `same` take.
+    id: u32,
+    /// Its time base is `info.time-base`.
+    info: stream-info,
+    /// The format the stream arrives in, resolved: never `like`. Packets
+    /// inputs carry `coded`.
+    format: option<output-format>,
+    rendition: rendition-meta,
+    /// The relation row the stream came from, where the call reads rows (a
+    /// sink handed a ladder); the publisher names its tracks by it.
+    row: option<u32>,
+    /// Packets inputs: how deep the stream reorders, as `input-stream`
+    /// carries it at 0.18. 0 elsewhere.
+    decode-delay: u32,
+    /// Data inputs: the producer's declared latency, when it has one.
+    latency: option<f64>,
+  }
+
+  record message {
+    pts: s64,
+    data: list<u8>,
+  }
+
+  record timed-rows {
+    pts: s64,
+    rows: list<string>,
+  }
+
+  record feed-start {
+    /// The source's tags, `smart_timed` among them.
+    tags: list<tuple<string, string>>,
+    /// Its first frame's pts, in its own time base.
+    first-pts: s64,
+    /// The clock time that first frame stands at, in the clock's time base:
+    /// what maps the source's pts onto the tick.
+    at: s64,
+  }
+
+  /// A hold input's feed: one source, from the tick its first frame shows
+  /// on to the last its last frame shows on, `linger` included. The source
+  /// going backwards, or forwards by more than a second, ends it and
+  /// starts the next.
+  record feed {
+    start: feed-start,
+    /// The clock time of the last tick its last frame shows on, once the
+    /// host can foretell it: the source ended, or timed out.
+    ends: option<s64>,
+  }
+
+  /// One frame as a tick sees it, without its bytes: a picture, or the
+  /// tick's audio samples as one run, which is a frame as codecs count
+  /// them.
+  record frame {
+    /// In the stream's time base; for audio, the first sample's.
+    pts: s64,
+    /// Its place in the stream's `frames` this tick, oldest first from 0:
+    /// what `fetch` and `same` name it by.
+    index: u32,
+    /// How long it is presented, in the stream's time base; none where
+    /// nothing settles it.
+    duration: option<s64>,
+    /// The rows that arrived with it, each a JSON object from an upstream
+    /// module. Empty on an input whose `rows` is `ignore`.
+    rows: list<string>,
+  }
+}
+
+/// What one tick holds.
+interface node-tick {
+  use types.{rational, packet, stream-info};
+  use node-types.{frame, message, feed, timed-rows};
+
+  /// One call's inputs, held by the host for exactly that call. A stream
+  /// is named by the `id` `init` gave it; an id `init` did not give, or an
+  /// index at or past the length of that stream's `frames`, is a
+  /// fault that stops the run.
+  ///
+  /// The tick's interval runs from its time to the next tick's: one stride
+  /// of a frame clock, one packet of a packets clock, every message
+  /// sharing one pts of a data clock, one period of a rate clock. A last
+  /// call's runs to the end of its inputs. Every input that is not the
+  /// clock hands what falls in it.
+  ///
+  /// The handle is the call's alone: it cannot be kept past the return,
+  /// and bytes a module means to keep are its own copy the moment `fetch`
+  /// hands them over.
+  resource tick {
+    /// The tick's time in `time-base`. An input clock: its first frame or
+    /// message this call, or the running maximum of dts over a packets
+    /// clock (pts where dts is unset), or, on a last call that hands none,
+    /// the time just past its last. A rate clock: the tick's number, from
+    /// 0. A self-clocked node: microseconds since its first call.
+    pts: func() -> s64;
+
+    /// The clock input's time base, the inverse of a rate clock's rate, or
+    /// 1/1000000 for a self-clocked node.
+    time-base: func() -> rational;
+
+    /// Whether this is the instance's final call. It carries whatever the
+    /// inputs have left, which may be nothing, and happens exactly once.
+    /// There is no separate flush.
+    last: func() -> bool;
+
+    /// The streams bound to input `port`, in `init`'s order: the same every
+    /// tick, empty for an optional port with nothing bound. A name the
+    /// shape does not declare is a fault.
+    streams: func(port: string) -> list<u32>;
+
+    /// The stream as the host knows it this tick, its time base included.
+    /// A hold input's tags and time base are its current source's, from
+    /// each feed's start on.
+    info: func(id: u32) -> stream-info;
+
+    /// A hold input's feed as it stands this tick: the same record on
+    /// every tick the source shows on, so a worker that missed the start
+    /// still sees it; none while nothing shows, and on every other input.
+    /// A feed that ends and another that starts within one tick are two
+    /// ticks.
+    feed: func(id: u32) -> option<feed>;
+
+    /// Frame kinds: the frames this tick hands, oldest first. The clock and
+    /// a lockstep input hand their window. A hold input hands the frame it
+    /// shows, or none before its feed's first frame and once its feed has
+    /// ended. Audio hands one frame, the tick's samples re-cut from
+    /// whatever packets arrived; a hold audio input hands none while its
+    /// source is behind, and the node fills the silence. Empty on message
+    /// kinds.
+    frames: func(id: u32) -> list<frame>;
+
+    /// Item `index`'s bytes, copied on demand: the only copy of a frame
+    /// kind's payload. Video: one frame's pixels in the stream's format,
+    /// tightly packed. Audio: interleaved samples in its sample format.
+    fetch: func(id: u32, index: u32) -> list<u8>;
+
+    /// Data inputs: the messages this tick hands under the input's pairing,
+    /// in pts order, each delivered once. Empty on other kinds.
+    messages: func(id: u32) -> list<message>;
+
+    /// Packets inputs: the packets this tick hands, in decode order, each
+    /// delivered once. Empty on other kinds.
+    packets: func(id: u32) -> list<packet>;
+
+    /// For an input whose `rows` is `state`: the rows of every tick this
+    /// instance did not process since its previous call, oldest first,
+    /// each beside the pts it arrived at, all earlier than this call's. An
+    /// instance's first call is handed every one before it. A data input's
+    /// rows are its messages. Empty on every other input.
+    earlier-rows: func(id: u32) -> list<timed-rows>;
+  }
+}
+
+/// A node: typed inputs, typed outputs and a clock, its shape from its
+/// params.
+interface node {
+  use types.{meta, packet, raw-frame};
+  use node-types.{bound-stream, message, node-shape};
+  use node-tick.{tick};
+
+  /// An input frame's bytes leaving on an output, never copied into the
+  /// module: frame `index` of stream `id`'s `frames` this tick. Its format
+  /// must be the port's (size and pixel format, or sample format, rate and
+  /// channels); the host ends the run otherwise. Audio may leave this way
+  /// only from an input whose stride is its window, since overlapping
+  /// windows would emit samples twice.
+  record same-frame {
+    pts: s64,
+    duration: option<s64>,
+    id: u32,
+    index: u32,
+  }
+
+  /// One thing leaving. Its pts and duration are in its port's time base,
+  /// and the module's to choose.
+  variant payload {
+    /// New bytes in the port's format: one frame's pixels, tightly packed,
+    /// or a run of interleaved samples.
+    frame(raw-frame),
+    same(same-frame),
+    /// For codec "json", one UTF-8 JSON object. Empty: a progress mark,
+    /// never delivered; the port's progress stands at its pts.
+    message(message),
+    packet(packet),
+  }
+
+  record emission {
+    /// An output's name in the node's shape.
+    port: string,
+    payload: payload,
+  }
+
+  /// What one tick produced.
+  record emitted {
+    /// Per port, frames and messages never go back in pts, within a call
+    /// or across calls, and packets keep decode order with dts never
+    /// decreasing. Ports interleave freely.
+    items: list<emission>,
+    /// Rows for the run's rows output, as a sink's are.
+    rows: list<string>,
+    /// Nothing more will leave: the host makes the last call and then ends
+    /// every output. A node on an input clock ends with that input and need
+    /// not set it.
+    finished: bool,
+  }
+
+  /// Takes no params, so the compiler validates params before it asks for
+  /// a shape. A node leaves the format lists empty, since its ports say
+  /// what they accept in `shape`; `rows-schema` describes `emitted.rows`,
+  /// each data port carries its own `schema`, and `rows-language` tags
+  /// every "json" output.
+  describe: func() -> meta;
+
+  /// The ports and clock for these params, and for `bound`: the inputs
+  /// the call binds, by the declaration's names, so a shape may turn on
+  /// what is given (a page with no picture ticks at a rate; an output
+  /// `like` an unbound input is left out). Called at compile time with the
+  /// call's static params, once per distinct (module, params, bound), and
+  /// cached; a source may read the network here to learn its outputs, as
+  /// `probe` did. Callable at any point in an instance's life: it reads
+  /// nothing `init` or `set-params` set.
+  ///
+  /// The host refuses a shape in which `clock` names no input, or one that
+  /// is optional, `many` or not lockstep; an input is lockstep with no
+  /// input clock, or paired other than `arrival` on a self-clocked node;
+  /// `hold` is on a message kind or `interval` on a frame kind; a data
+  /// input's `rows` is `ignore`; `like` names an input that is not single
+  /// and bound; or a stride is 0 or above its window.
+  shape: func(params: string, bound: list<string>) -> result<node-shape, string>;
+
+  /// Opens an instance for `shape(params, bound)` on the streams bound to
+  /// its inputs, one entry each: ports in the shape's order, a port's
+  /// streams in the order the query named them, none for an optional port
+  /// with nothing bound. Each `id` is distinct and names its stream, in
+  /// every tick call and in `same`, for the instance's life. `latched`
+  /// names the outputs the query latched onto; the node may leave the rest
+  /// unmade.
+  init: func(bound: list<bound-stream>, latched: list<string>, params: string) -> result<_, string>;
+
+  /// Replaces the params between ticks. Params whose shape differs from
+  /// the instance's are refused by the host and never reach this call, so
+  /// a pairing's fields and a port's latency never change under an
+  /// instance; an Err leaves the previous params in force.
+  set-params: func(params: string) -> result<_, string>;
+
+  /// One tick. An Err ends the run with its message, as a panic does; a
+  /// tick with nothing to emit returns Ok with nothing. A self-clocked
+  /// node's call may wait until it has something, and is called again as
+  /// soon as it returns.
+  ///
+  /// Unless the node is self-clocked, returning promises that no output
+  /// still has anything to send stamped earlier than the end of the tick's
+  /// interval less the port's `latency`. The host sends that time down
+  /// each data edge as the node's progress, and never less than the last
+  /// message's pts; a message that breaks the promise reaches its
+  /// consumers late, and is reported.
+  process: func(tick: borrow<tick>) -> result<emitted, string>;
+}
+
+
+interface values {
+  /// Static description of one value function, available without calling it.
+  record function-meta {
+    name: string,
+    /// JSON Schema for `invoke`'s `args` object.
+    params-schema: string,
+    /// JSON Schema for the value `invoke` returns.
+    result-schema: string,
+  }
+
+  list-functions: func() -> list<function-meta>;
+
+  /// `args` is one JSON object keyed by parameter name. The ok string is one
+  /// JSON value; the err string is the module's own message.
+  invoke: func(name: string, args: string) -> result<string, string>;
+}
+
+/// A codec a package implements, where ffmpeg's own encoder would stand:
+/// raw frames in, coded packets out. A query names it in an output's options
+/// (`video_codec => ffrwd.pyrowave.encode(bitrate => 200000000)`) and its
+/// packets leave through whatever that output is.
+///
+/// ffmpeg knows no codec a package brings, so the codec's identity on the
+/// wire is its four-character tag: what a container writes for it, and what
+/// a `decoder` names as the tags it reads.
+interface encoder {
+  use types.{coded-stream, format, meta, packet, raw-frame, rational, stream-info};
+
+  record encoder-meta {
+    /// `meta.pixel-formats` or `meta.sample-formats` name the frames it
+    /// takes, most preferred first, the way a filter's do, and say its kind.
+    meta: meta,
+    /// The codec's name as a query, a message or a catalog spells it:
+    /// "pyrowave".
+    codec: string,
+    /// The four-character tag a container writes for it: "PYRW". Four
+    /// ASCII characters, exactly.
+    fourcc: string,
+    /// How many frames it takes in before its first packet leaves: 0 for an
+    /// intra-only codec that answers every frame in the call that brings it.
+    delay: u32,
+    /// How deep its packets reorder: how many packets a decoder holds back
+    /// before the first frame leaves it. 0 where decode order is
+    /// presentation order.
+    decode-delay: u32,
+    /// For audio, the samples every frame but the last must hold, which the
+    /// host cuts the stream into before it arrives; 0 takes a run of any
+    /// length. Always 0 for video.
+    frame-samples: u32,
+  }
+
+  describe: func() -> encoder-meta;
+
+  /// Called once per instance. `format` is the frames it takes: the arm is
+  /// its kind, and the pix-fmt or sample-fmt one `meta` named. `info` is the
+  /// stream being encoded; its time base is the one frames arrive in.
+  /// `frame-rate` is the stream's nominal frame rate for video, what a
+  /// bitrate-driven encoder divides its budget by; none for audio, and where
+  /// nothing says it.
+  ///
+  /// Answers the coded stream it writes: `codec` its own name, the time base
+  /// its packets are counted in (ordinarily `info.time-base`), the geometry,
+  /// and `extradata`, the codec's out-of-band header, which a container
+  /// writes before the first packet.
+  init: func(format: format, info: stream-info, frame-rate: option<rational>, params: string) -> result<coded-stream, string>;
+
+  /// Frames in presentation order, as many as have arrived. Answers the
+  /// packets that left, in decode order, which may be none while the codec
+  /// holds frames back. `last` marks the final call, which happens exactly
+  /// once and may carry no frame: every frame still held leaves on it.
+  ///
+  /// A video frame's `data` is tightly packed, exactly as ffmpeg's rawvideo
+  /// carries it in NUT: the planes one after another, each row directly
+  /// after the last with no padding between. The host hands the payload
+  /// through unchanged.
+  encode: func(frames: list<raw-frame>, last: bool) -> result<list<packet>, string>;
+}
+
+/// The mirror of `encoder`: coded packets in, raw frames out. A package
+/// declares the tags it reads, and an input whose stream carries one of them
+/// is decoded by it where ffmpeg would have decoded it.
+interface decoder {
+  use types.{coded-stream, format, meta, packet, raw-frame, stream-info};
+
+  record decoder-meta {
+    /// `meta.pixel-formats` or `meta.sample-formats` name the frames it can
+    /// write, most preferred first, and say its kind.
+    meta: meta,
+    /// The four-character tags it reads, as its encoder writes them.
+    fourccs: list<string>,
+    /// How many packets it takes in before its first frame leaves.
+    delay: u32,
+  }
+
+  describe: func() -> decoder-meta;
+
+  /// Called once per instance with the coded stream as the container
+  /// declared it: its tag in `codec`, its extradata, its geometry and its
+  /// time base. Answers the frames it writes, whose arm is the stream's kind
+  /// and whose pix-fmt or sample-fmt is one `meta` named.
+  init: func(coded: coded-stream, info: stream-info, params: string) -> result<format, string>;
+
+  /// Packets in decode order, as many as have arrived. Answers the frames
+  /// that left, in presentation order, in the stream's time base. `last`
+  /// marks the final call, which happens exactly once and may carry no
+  /// packet: every frame still held leaves on it.
+  decode: func(packets: list<packet>, last: bool) -> result<list<raw-frame>, string>;
+}
+
+/// A node module. A module that also imports `wasi:nn`, `wasi:webgpu`,
+/// `wasi:http` or `wasi:sockets` includes this world in its own.
+///
+/// `values`, `encoder`, `decoder` and their worlds stay as they are at
+/// 0.18.0. Any of them may ride beside `node` in one component, whose
+/// world includes this one and theirs.
+world node-module {
+  import node-tick;
+  export node;
+}
+world values-module { export values; }
+world encoder-module { export encoder; }
+world decoder-module { export decoder; }
+world codec-module { export encoder; export decoder; }

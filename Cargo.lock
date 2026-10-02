@@ -32,6 +32,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,11 +87,12 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clips"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "describe-common",
+ "ffrwd-frame",
+ "ffrwd-node",
  "serde",
- "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]
@@ -204,6 +211,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "describe-common"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "document-features"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+dependencies = [
+ "litrs",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,8 +234,10 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "embed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "describe-common",
+ "ffrwd-node",
  "serde",
  "serde_json",
  "tokenizers",
@@ -221,8 +246,10 @@ dependencies = [
 
 [[package]]
 name = "embed_clip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "describe-common",
+ "ffrwd-node",
  "serde",
  "serde_json",
  "tokenizers",
@@ -250,6 +277,35 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fast_image_resize"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9c50201dc184ba6553da1695aac20a042efffbe2d84542cee31917c86c3ab1e"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "num-traits",
+ "thiserror",
+]
+
+[[package]]
+name = "ffrwd-frame"
+version = "0.1.0"
+dependencies = [
+ "fast_image_resize",
+]
+
+[[package]]
+name = "ffrwd-node"
+version = "0.1.0"
+source = "git+https://github.com/imbcmdth/ffrwd-node?tag=v0.1.0#84216905037bae949623b6df22febc8fbbc50e17"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen",
 ]
 
 [[package]]
@@ -355,6 +411,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "litrs"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -429,6 +491,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "num-traits"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
@@ -650,11 +721,12 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "sounds"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "describe-common",
+ "ffrwd-node",
  "serde",
  "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]

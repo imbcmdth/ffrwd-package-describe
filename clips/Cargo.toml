@@ -1,6 +1,6 @@
 [package]
 name = "clips"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -8,6 +8,9 @@ name = "clips"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.57.1"
+describe-common = { path = "../common" }
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }
+# E:\projects\ffrwd-frame on its `yuv` branch, which is not merged yet: this
+# moves to a tag of ffrwd-frame once it is.
+ffrwd-frame = { path = "../../ffrwd-frame" }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"

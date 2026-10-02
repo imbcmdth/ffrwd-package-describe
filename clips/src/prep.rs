@@ -8,7 +8,12 @@
 //! triangle filter whose support widens with the reduction, so a frame
 //! shrunk five-fold averages the pixels it passes over rather than sampling
 //! one in five. It runs on 8-bit values and rounds back to 8 bits before the
-//! crop, which is where the reference puts its own rescale.
+//! crop, which is where the reference puts its own rescale. It stays this
+//! crate's own rather than ffrwd-frame's, which rounds to eight bits between
+//! its two passes where this rounds once, after both: the swap would move
+//! every vector the package has written.
+
+use ffrwd_frame::Rgba;
 
 /// The side of the square the tower is exported at.
 pub const SIDE: usize = 224;
@@ -23,24 +28,6 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 /// One frame's tensor: three planes of `SIDE`x`SIDE`.
 const PLANE: usize = SIDE * SIDE;
 pub const TENSOR: usize = 3 * PLANE;
-
-/// The pixel format an instance was opened for, fixed for its life.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PixFmt {
-    Yuv420p,
-    Rgba,
-}
-
-impl PixFmt {
-    /// The format the host named, or an error naming what it was.
-    pub fn parse(named: &str) -> Result<PixFmt, String> {
-        match named {
-            "yuv420p" => Ok(PixFmt::Yuv420p),
-            "rgba" => Ok(PixFmt::Rgba),
-            other => Err(format!("clips does not accept pixel format {other}")),
-        }
-    }
-}
 
 /// The size the short-side resize lands on, as (height, width). The short
 /// side becomes `SHORT_EDGE` and the long one keeps the shape, truncated -
@@ -106,53 +93,26 @@ fn taps(out_size: usize, in_size: usize) -> Vec<Tap> {
 
 /// One frame row as red, green and blue, a channel at a time so each is
 /// contiguous.
-fn row_to_rgb(
-    frame: &[u8],
-    pix_fmt: PixFmt,
-    width: usize,
-    height: usize,
-    y: usize,
-    out: &mut [f32],
-) {
+fn row_to_rgb(frame: &Rgba, y: usize, out: &mut [f32]) {
+    let width = frame.width;
     let (red, rest) = out.split_at_mut(width);
     let (green, blue) = rest.split_at_mut(width);
-    match pix_fmt {
-        PixFmt::Rgba => {
-            for (x, pixel) in frame[y * width * 4..(y + 1) * width * 4]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-            {
-                red[x] = f32::from(pixel[0]);
-                green[x] = f32::from(pixel[1]);
-                blue[x] = f32::from(pixel[2]);
-            }
-        }
-        PixFmt::Yuv420p => {
-            let pixels = width * height;
-            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-            let chroma = cw * ch;
-            let luma = &frame[y * width..(y + 1) * width];
-            let crow = (y / 2).min(ch - 1) * cw;
-            for x in 0..width {
-                let l = f32::from(luma[x]);
-                let ci = crow + (x / 2).min(cw - 1);
-                let u = f32::from(frame[pixels + ci]) - 128.0;
-                let v = f32::from(frame[pixels + chroma + ci]) - 128.0;
-                // The usual BT.601 inverse, in full range: the frames a module
-                // is handed are what the host decoded, not studio-swing video.
-                red[x] = l + 1.402 * v;
-                green[x] = l - 0.344_136 * u - 0.714_136 * v;
-                blue[x] = l + 1.772 * u;
-            }
-        }
+    for (x, pixel) in frame.data[y * width * 4..(y + 1) * width * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        red[x] = f32::from(pixel[0]);
+        green[x] = f32::from(pixel[1]);
+        blue[x] = f32::from(pixel[2]);
     }
 }
 
 /// The frame resized, cropped and normalized: one `[3, SIDE, SIDE]` tensor,
 /// red, green and blue in turn.
-pub fn preprocess(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) -> Vec<f32> {
+pub fn preprocess(frame: &Rgba) -> Vec<f32> {
+    let (width, height) = (frame.width, frame.height);
     let (out_h, out_w) = resized_size(width, height);
     let columns = taps(out_w, width);
     let rows = taps(out_h, height);
@@ -162,7 +122,7 @@ pub fn preprocess(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) ->
     let mut wide = vec![0f32; 3 * height * out_w];
     let mut rgb = vec![0f32; width * 3];
     for y in 0..height {
-        row_to_rgb(frame, pix_fmt, width, height, y, &mut rgb);
+        row_to_rgb(frame, y, &mut rgb);
         for channel in 0..3 {
             let source = &rgb[channel * width..(channel + 1) * width];
             let target = &mut wide[(channel * height + y) * out_w..][..out_w];
@@ -261,7 +221,7 @@ mod tests {
         // 51/255 is exactly 0.2, so each channel lands on
         // (0.2 - mean) / std with nothing to interpolate.
         let frame = flat_rgba(64, 48, [51, 51, 51]);
-        let tensor = preprocess(&frame, PixFmt::Rgba, 64, 48);
+        let tensor = preprocess(&Rgba::new(&frame, 64, 48).expect("64x48"));
         assert_eq!(tensor.len(), TENSOR);
         for channel in 0..3 {
             let expected = (0.2 - MEAN[channel]) / STD[channel];
@@ -290,7 +250,7 @@ mod tests {
                 frame[base + 2] = 255;
             }
         }
-        let tensor = preprocess(&frame, PixFmt::Rgba, width, height);
+        let tensor = preprocess(&Rgba::new(&frame, width, height).expect("a frame"));
         let white = (1.0 - MEAN[0]) / STD[0];
         let black = (0.0 - MEAN[0]) / STD[0];
         // The crop spans source columns 224..672 of the 448-wide resize,
@@ -303,20 +263,6 @@ mod tests {
             row[SIDE - 1]
         );
         assert!((row[0] - black).abs() < 1e-4, "got {}", row[0]);
-    }
-
-    #[test]
-    fn neutral_chroma_yuv_is_grayscale_rgb() {
-        let (width, height) = (4usize, 4usize);
-        let mut frame = vec![100u8; width * height];
-        frame.extend(vec![128u8; 2 * 2 * 2]);
-        let mut rgb = vec![0f32; width * 3];
-        row_to_rgb(&frame, PixFmt::Yuv420p, width, height, 0, &mut rgb);
-        for x in 0..width {
-            assert!((rgb[x] - 100.0).abs() < 0.01, "red is the luma");
-            assert!((rgb[width + x] - 100.0).abs() < 0.01);
-            assert!((rgb[2 * width + x] - 100.0).abs() < 0.01);
-        }
     }
 
     /// A 32x32 rgba ramp: red is the column, green the row, blue their sum.
@@ -341,7 +287,8 @@ mod tests {
         // edge, rounded back to 8 bits, centre-cropped, rescaled by 1/255 and
         // normalized. A 32x32 frame is square, so the resize is 32 -> 224 and
         // the crop takes everything.
-        let tensor = preprocess(&ramp_rgba(), PixFmt::Rgba, 32, 32);
+        let ramp = ramp_rgba();
+        let tensor = preprocess(&Rgba::new(&ramp, 32, 32).expect("32x32"));
         // Corners and centre of each plane: (channel, y, x, value).
         let expected: [(usize, usize, usize, f32); 9] = [
             (0, 0, 0, -2.117_904),

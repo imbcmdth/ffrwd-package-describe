@@ -8,13 +8,13 @@
 target/
 build/
 
-# The wit each module's build.rs copies out of the installed ffrwd/wasm.
-wit/
-
-# The Rust workspace that builds the four modules. The modules ship; their
-# sources are read on GitHub.
+# The Rust workspace that builds the four modules, and the copy of
+# ffrwd:av the two `values` exports are built against. The modules ship;
+# their sources are read on GitHub.
 Cargo.toml
 Cargo.lock
+wit/
+common/
 clips/
 sounds/
 embed/
