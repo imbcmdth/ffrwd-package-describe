@@ -10,11 +10,11 @@ not this package's job - it composes
 and [`ffrwd/vad`](https://github.com/imbcmdth/ffrwd-package-vad)
 instead of shipping a third model for it.
 
-Requires ffrwd 0.29.
+Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
 The four modules are built and run:
 `target/wasm32-wasip2/release/{clips,sounds,embed,embed_clip}.wasm`, all
-nodes of the `ffrwd:av@0.19.0` world. `ffrwd install` is the whole of the
+nodes of the `ffrwd:av@0.19.1` world. `ffrwd install` is the whole of the
 setup.
 
 ## The functions

@@ -4,5 +4,5 @@ package ffrwd:embed;
 /// one prompt, as a value function. `wasi:nn` comes in through the common
 /// crate's world.
 world embed {
-  export ffrwd:av/values@0.19.0;
+  export ffrwd:av/values@0.19.1;
 }

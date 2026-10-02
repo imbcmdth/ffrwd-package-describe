@@ -37,7 +37,7 @@
 //! itself pools this model's output.
 
 // The values export rides on bindings of its own beside the node ffrwd-node
-// exports; `../wit` is ffrwd:av@0.19.0 as the SDK carries it, byte for byte.
+// exports; `../wit` is ffrwd:av@0.19.1 as the SDK carries it, byte for byte.
 wit_bindgen::generate!({
     path: ["../wit", "wit-world"],
     world: "ffrwd:embed/embed",

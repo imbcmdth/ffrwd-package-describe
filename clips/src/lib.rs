@@ -47,9 +47,15 @@ const EMBEDDING: usize = 512;
 /// something about them, where eight spread over five minutes do not.
 const CAP: f64 = 10.0;
 
-/// The frame past the cap that closes a stretch, which `shape` cannot size:
-/// it does not see the clock's rate. Half a second covers 2 fps and up.
+/// The frame past the cap that closes a stretch, where the call leaves the
+/// clock's rate unknown: half a second covers 2 fps and up.
 const FRAME_MARGIN: f64 = 0.5;
+
+/// How late a row may leave: the cap, and the frame that reaches it, which
+/// is one frame of the clock's rate where the call says what that is.
+fn latency(rate: Option<Rational>) -> f64 {
+    CAP + rate.map_or(FRAME_MARGIN, |rate| rate.duration(1))
+}
 
 // `vector`'s minItems/maxItems fix EMBEDDING as the rows' `vector_dims`: the
 // compiler reads them at compile time, since it cannot count a run-time
@@ -259,7 +265,7 @@ impl Node for Clips {
     const VERSION: &'static str = "0.2.0";
     type Params = NoParams;
 
-    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+    fn shape(_: &NoParams, bound: &Bound) -> Result<Shape> {
         Ok(Shape::new()
             .input(
                 Input::video("v")
@@ -270,7 +276,7 @@ impl Node for Clips {
             .output(
                 Output::rows("shots")
                     .time_base(Rational::MICROS)
-                    .latency(CAP + FRAME_MARGIN)
+                    .latency(latency(bound.rate_of("v")))
                     .schema_json(ROWS_SCHEMA),
             ))
     }
@@ -349,6 +355,21 @@ mod tests {
         assert!(shots.latency > CAP, "a row leaves a frame past the cap");
         assert!(!shape.pure, "the reservoir and the shot running carry over");
         assert!(Runner::<Clips>::shape("", &["v".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn a_row_leaves_one_frame_of_the_bound_rate_past_the_cap() {
+        let at = |rate: Option<Rational>| {
+            let bound = match rate {
+                Some(rate) => Bound::new(&["v", "cuts"]).rate("v", rate),
+                None => Bound::new(&["v", "cuts"]),
+            };
+            Runner::<Clips>::shape("", &bound).expect("a shape").outputs[0].latency
+        };
+        assert_eq!(at(Some(Rational::new(25, 1))), 10.04);
+        assert_eq!(at(Some(Rational::new(30000, 1001))), 10.0 + 1001.0 / 30000.0);
+        assert_eq!(at(Some(Rational::new(2, 1))), 10.5);
+        assert_eq!(at(None), 10.5, "half a second where the rate is unknown");
     }
 
     #[test]
