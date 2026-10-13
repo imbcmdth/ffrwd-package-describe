@@ -12,6 +12,9 @@
 //! crate's own rather than ffrwd-frame's, which rounds to eight bits between
 //! its two passes where this rounds once, after both: the swap would move
 //! every vector the package has written.
+//!
+//! The GPU build reads the constants alone: the host makes its tensors.
+#![cfg_attr(all(feature = "gpu", not(test)), allow(dead_code))]
 
 use ffrwd_frame::Rgba;
 
@@ -22,8 +25,8 @@ pub const SIDE: usize = 224;
 /// and the two are different quantities.
 const SHORT_EDGE: usize = 224;
 
-const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const STD: [f32; 3] = [0.229, 0.224, 0.225];
+pub const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// One frame's tensor: three planes of `SIDE`x`SIDE`.
 const PLANE: usize = SIDE * SIDE;

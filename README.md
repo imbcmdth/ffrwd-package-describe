@@ -14,8 +14,8 @@ Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
 The four modules are built and run:
 `target/wasm32-wasip2/release/{clips,sounds,embed,embed_clip}.wasm`, all
-nodes of the `ffrwd:av@0.19.1` world. `ffrwd install` is the whole of the
-setup.
+nodes of the `ffrwd:av@0.19.1` world, and `clips_gpu.wasm`, clips' source
+built beside `ffrwd:gpu`. `ffrwd install` is the whole of the setup.
 
 ## The functions
 
@@ -25,6 +25,18 @@ setup.
   stretch ends. `cuts` is a `{shot}` row a frame from a detector over the
   same picture, `ffrwd.shots.simple_detector(v)`; left out, the whole
   input is one shot. No picture leaves.
+- `clips_gpu(v, cuts => <rows>, memory DEFAULT 'gpu')` returns `clips`'
+  rows, the host making each frame the module keeps into the tower's input
+  and joining the eight, so the module never reads the picture. With
+  `memory => 'gpu'` the picture stays on the GPU; each kept frame's centre
+  square is resized and normalised there, and where the tower's session
+  reads the device's memory the eight are joined on the device and bound
+  to it in place. The frame's centre square is resized in one pass where
+  `clips` resizes and then crops, and nothing is rounded to 8 bits, so a
+  vector agrees with `clips`' to a cosine of 0.994 to 0.9999 on a five-shot
+  test clip at 1080p and 4K, and ranks shots the same way. `cuts` comes from
+  `ffrwd.shots.simple_detector_gpu(v)` over the same picture. It imports
+  `ffrwd:gpu`, so it runs where the sidecar has GPU support.
 - `sounds(a, threshold DEFAULT 0.3, top DEFAULT 3)` returns `cue[]`: up
   to `top` AudioSet labels a ten-second window, windows half a window
   apart, each leaving with its window. No sound leaves.
@@ -98,12 +110,14 @@ Four, in two pairs. One pair reads a file that has sound, the other a file
 that does not, because the dialect has no way to make a stream optional
 inside one query: `f.audio[1]` on a silent source is
 `STREAM_NOT_FOUND: 'f.audio[1]' does not exist`, at compile time, before
-anything runs. Splitting the recipe is the whole fix.
+anything runs. Splitting the recipe is the whole fix. `describe-video-gpu`
+is `describe-video` with `simple_detector_gpu` and `clips_gpu`.
 
 | recipe | source | writes |
 | --- | --- | --- |
 | `describe` | has audio | video with vectors woven in, the audio, and two caption tracks |
 | `describe-video` | any | video with vectors woven in |
+| `describe-video-gpu` | any | `describe-video`'s file, the shots and vectors made on the GPU |
 | `find` | described, has audio | the matching spans, video and audio |
 | `find-video` | described | the matching spans, video alone |
 
@@ -288,7 +302,7 @@ rather than naming a number.)
 ## Building
 
 For a contributor with the checkout. An installed copy of the package needs
-none of this: the four modules travel in the archive.
+none of this: the modules travel in the archive.
 
 ```
 cargo build --target wasm32-wasip2 --release
@@ -299,7 +313,9 @@ Every module is a node written with
 [`ffrwd-node`](https://github.com/imbcmdth/ffrwd-node), which carries the
 world it is built against, and `common/` is the `wasi:nn` glue the four
 share. `embed` and `embed_clip` also export `values`, on bindings of their
-own built from `wit/av.wit`, a copy of the same world.
+own built from `wit/av.wit`, a copy of the same world. `clips-gpu` builds
+clips' source with its `gpu` feature on, as `clips_gpu.wasm`, over the copy
+of the sidecar's `ffrwd:gpu` wit in `clips/wit-gpu/`.
 
 The X-CLIP ONNX export under `build/xclip` is `scripts/export_xclip.py`'s
 output, pinned to the revision the manifest names.

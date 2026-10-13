@@ -7,8 +7,9 @@
 //! therefore always evenly spread over the shot so far, at a spacing that
 //! halves the memory rather than the coverage. Closing it resamples that
 //! spread down to the eight the tower takes.
-
-use crate::prep::TENSOR;
+//!
+//! What a kept frame is made into is the caller's: its tensor's floats in the
+//! host build, the host's tensor in the GPU build.
 
 /// Frames one clip carries, fixed by the export.
 pub const FRAMES: usize = 8;
@@ -18,21 +19,21 @@ pub const FRAMES: usize = 8;
 /// to eight always has eight distinct frames to choose from.
 const CAPACITY: usize = 2 * FRAMES;
 
-/// One kept frame: where it sat in the shot, and its tensor.
-struct Kept {
+/// One kept frame: where it sat in the shot, and what it was made into.
+struct Kept<T> {
     index: usize,
-    tensor: Vec<f32>,
+    picture: T,
 }
 
-pub struct Reservoir {
-    kept: Vec<Kept>,
+pub struct Reservoir<T> {
+    kept: Vec<Kept<T>>,
     /// Frames between the ones kept; doubles as the shot grows.
     stride: usize,
     /// Frames the shot has carried, kept or not.
     seen: usize,
 }
 
-impl Default for Reservoir {
+impl<T> Default for Reservoir<T> {
     fn default() -> Self {
         Reservoir {
             kept: Vec::with_capacity(CAPACITY + 1),
@@ -42,14 +43,14 @@ impl Default for Reservoir {
     }
 }
 
-impl Reservoir {
+impl<T> Reservoir<T> {
     /// Offers the shot's next frame. `preprocess` runs only for the frames
     /// the reservoir keeps, so a long shot pays for one frame in `stride`.
-    pub fn offer<E>(&mut self, preprocess: impl FnOnce() -> Result<Vec<f32>, E>) -> Result<(), E> {
+    pub fn offer<E>(&mut self, preprocess: impl FnOnce() -> Result<T, E>) -> Result<(), E> {
         if self.seen.is_multiple_of(self.stride) {
             self.kept.push(Kept {
                 index: self.seen,
-                tensor: preprocess()?,
+                picture: preprocess()?,
             });
             if self.kept.len() > CAPACITY {
                 self.thin();
@@ -76,22 +77,22 @@ impl Reservoir {
         self.kept.last().map(|k| k.index) == self.seen.checked_sub(1)
     }
 
-    /// The eight frames the tower reads, back to back as one
-    /// `[FRAMES, 3, SIDE, SIDE]` tensor, and the reservoir emptied for the
-    /// next shot. `last` is the shot's final frame, which `holds_last` says
+    /// The frames kept, in order, and which eight of them the tower reads,
+    /// in the order it reads them; the reservoir is emptied for the next
+    /// shot. `last` is the shot's final frame, which `holds_last` says
     /// whether the reservoir needs.
-    pub fn close(&mut self, last: Option<Vec<f32>>) -> Vec<f32> {
-        if let Some(tensor) = last {
+    pub fn close(&mut self, last: Option<T>) -> (Vec<T>, [usize; FRAMES]) {
+        if let Some(picture) = last {
             let index = self.seen.saturating_sub(1);
-            self.kept.push(Kept { index, tensor });
+            self.kept.push(Kept { index, picture });
         }
         let picked = spread(self.kept.len());
-        let mut input = Vec::with_capacity(FRAMES * TENSOR);
-        for at in picked {
-            input.extend_from_slice(&self.kept[at].tensor);
-        }
+        let kept = std::mem::take(&mut self.kept)
+            .into_iter()
+            .map(|kept| kept.picture)
+            .collect();
         *self = Reservoir::default();
-        input
+        (kept, picked)
     }
 
     #[cfg(test)]
@@ -126,7 +127,7 @@ mod tests {
 
     /// A reservoir fed `count` frames, each tensor one value long standing in
     /// for the real one.
-    fn fed(count: usize) -> Reservoir {
+    fn fed(count: usize) -> Reservoir<Vec<f32>> {
         let mut reservoir = Reservoir::default();
         for i in 0..count {
             reservoir
@@ -134,6 +135,11 @@ mod tests {
                 .expect("offered");
         }
         reservoir
+    }
+
+    /// What `close` answered, the picks' values back to back.
+    fn picked((kept, picks): (Vec<Vec<f32>>, [usize; FRAMES])) -> Vec<f32> {
+        picks.iter().flat_map(|&at| kept[at].clone()).collect()
     }
 
     #[test]
@@ -195,7 +201,7 @@ mod tests {
         assert!(!reservoir.holds_last());
         // Frame 59 goes in beside the fifteen kept, and eight of the sixteen
         // are taken.
-        let input = reservoir.close(Some(vec![59.0]));
+        let input = picked(reservoir.close(Some(vec![59.0])));
         assert_eq!(
             input,
             vec![0.0, 8.0, 16.0, 24.0, 36.0, 44.0, 52.0, 59.0],
@@ -208,6 +214,6 @@ mod tests {
     fn closing_a_one_frame_shot_repeats_it_eight_times() {
         let mut reservoir = fed(1);
         assert!(reservoir.holds_last());
-        assert_eq!(reservoir.close(None), vec![0.0; FRAMES]);
+        assert_eq!(picked(reservoir.close(None)), vec![0.0; FRAMES]);
     }
 }

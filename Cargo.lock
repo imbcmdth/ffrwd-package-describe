@@ -93,6 +93,18 @@ dependencies = [
  "ffrwd-frame",
  "ffrwd-node",
  "serde",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "clips-gpu"
+version = "0.2.0"
+dependencies = [
+ "describe-common",
+ "ffrwd-frame",
+ "ffrwd-node",
+ "serde",
+ "wit-bindgen",
 ]
 
 [[package]]

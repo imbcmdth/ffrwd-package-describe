@@ -75,6 +75,16 @@ impl Model {
                 )
             })
             .collect();
+        self.compute(inputs)
+    }
+
+    /// `tensor`, one the host made, through the graph as its input `name`,
+    /// and every tensor it returned as `run` answers them.
+    pub fn run_tensor(&self, name: &str, tensor: Tensor) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.compute(vec![(name.to_string(), tensor)])
+    }
+
+    fn compute(&self, inputs: Vec<(String, Tensor)>) -> Result<Vec<(String, Vec<u8>)>, String> {
         let returned = self
             .context
             .compute(inputs)

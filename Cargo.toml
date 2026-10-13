@@ -2,10 +2,11 @@
 # The wasm modules this package ships. They build into
 # target/wasm32-wasip2/release/, which is where the lib SQL names them.
 # `common` is shared Rust the modules compile in; it ships nothing of its
-# own.
+# own. `clips-gpu` is clips' source with its `gpu` feature on.
 members = [
     "common",
     "clips",
+    "clips-gpu",
     "embed",
     "embed_clip",
     "sounds",

@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
   "capabilities": [
-    "nn"
+    "nn",
+    "gpu"
   ],
   "dependencies": {
     "ffrwd/index": "0.2.1",
@@ -27,6 +28,7 @@
   ],
   "lib": {
     "clips": "src/clips.sql",
+    "clips_gpu": "src/clips.sql",
     "sounds": "src/sounds.sql",
     "embed": "src/embed.sql",
     "embed_text": "src/embed.sql",
@@ -36,6 +38,7 @@
   "bin": {
     "describe": "recipes/describe.sql",
     "describe-video": "recipes/describe-video.sql",
+    "describe-video-gpu": "recipes/describe-video-gpu.sql",
     "find": "recipes/find.sql",
     "find-video": "recipes/find-video.sql"
   },

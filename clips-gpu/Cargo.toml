@@ -1,0 +1,23 @@
+[package]
+name = "clips-gpu"
+version = "0.2.0"
+edition = "2021"
+
+# clips' own source with the `gpu` feature on: the build that asks the host for
+# each kept frame as a tensor and for the eight joined into one, and may hold
+# its frames on the GPU, as clips_gpu.wasm beside the host build's clips.wasm.
+[lib]
+name = "clips_gpu"
+path = "../clips/src/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+default = ["gpu"]
+gpu = []
+
+[dependencies]
+describe-common = { path = "../common" }
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.2.0" }
+ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" }
+serde = { version = "1.0.229", features = ["derive"] }
+wit-bindgen = "0.57.1"

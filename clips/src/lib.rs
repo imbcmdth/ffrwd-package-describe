@@ -19,18 +19,46 @@
 //!
 //! Frames arrive as rgba, or as yuv420p converted here by ffrwd-frame in the
 //! range and matrix the stream declares.
+//!
+//! The `gpu` feature builds `clips_gpu`, the same node with a `memory` param,
+//! whose frames the host makes into the tower's input (see `gpu`): a frame
+//! the reservoir keeps is held as the host's tensor rather than as floats
+//! here, and the eight are joined by the host, so the module never fetches a
+//! frame.
 
 mod prep;
 mod reservoir;
 
-use describe_common::{le_bytes, le_f32s, normalize, Element, Feed, Model};
+#[cfg(feature = "gpu")]
+mod gpu;
+
+#[cfg(not(feature = "gpu"))]
+use describe_common::{le_bytes, Element, Feed};
+use describe_common::{le_f32s, normalize, Model};
+#[cfg(not(feature = "gpu"))]
 use ffrwd_frame::yuv::{self, Colour, Yuv420p};
+#[cfg(not(feature = "gpu"))]
 use ffrwd_frame::Rgba;
-use ffrwd_node::{Bound, Init, Input, NoParams, Node, Out, Output, Rational, Result, Shape, Tick};
+#[cfg(not(feature = "gpu"))]
+use ffrwd_node::NoParams;
+use ffrwd_node::{Bound, Init, Input, Node, Out, Output, Rational, Result, Shape, Tick};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(feature = "gpu"))]
 use prep::{SIDE, TENSOR};
 use reservoir::{Reservoir, FRAMES};
+
+/// The GPU build's params: where `v` is held.
+#[cfg(feature = "gpu")]
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["host","gpu"],"default":"host"}},"additionalProperties":false}"#;
+
+/// What a kept frame is held as: its tensor's floats, made here.
+#[cfg(not(feature = "gpu"))]
+type Picture = Vec<f32>;
+
+/// What a kept frame is held as: the host's tensor of it.
+#[cfg(feature = "gpu")]
+type Picture = gpu::Tensor;
 
 /// The name the host binds the graph to. `-nn clips=<path>`.
 const MODEL: &str = "clips";
@@ -89,7 +117,7 @@ fn is_new_shot(current: Option<i64>, incoming: Option<i64>) -> bool {
 struct Segment {
     start_pts: i64,
     last_pts: i64,
-    frames: Reservoir,
+    frames: Reservoir<Picture>,
 }
 
 impl Segment {
@@ -119,12 +147,14 @@ fn seconds_per_tick(time_base: Rational) -> f64 {
     f64::from(time_base.num) / f64::from(time_base.den)
 }
 
+#[cfg(not(feature = "gpu"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Arrives {
     Rgba,
     Yuv420p(Colour),
 }
 
+#[cfg(not(feature = "gpu"))]
 fn colour(color: Option<&ffrwd_node::ColorInfo>) -> Result<Colour, String> {
     Colour::of(color.map(|color| yuv::ColorInfo {
         range: &color.range,
@@ -135,6 +165,7 @@ fn colour(color: Option<&ffrwd_node::ColorInfo>) -> Result<Colour, String> {
 }
 
 /// One frame turned into the tower's tensor, by way of rgba.
+#[cfg(not(feature = "gpu"))]
 fn tensor_of(
     arrives: Arrives,
     bytes: &[u8],
@@ -176,9 +207,13 @@ fn take(outputs: Vec<(String, Vec<u8>)>) -> Result<Vec<f32>, String> {
 struct Clips {
     v: u32,
     cuts: Option<u32>,
+    #[cfg(not(feature = "gpu"))]
     width: usize,
+    #[cfg(not(feature = "gpu"))]
     height: usize,
+    #[cfg(not(feature = "gpu"))]
     arrives: Arrives,
+    #[cfg(not(feature = "gpu"))]
     rgba: Vec<u8>,
     /// Seconds one timestamp unit is worth, from the stream's time base.
     tick: f64,
@@ -186,16 +221,35 @@ struct Clips {
     current_shot: Option<i64>,
     /// The newest frame's bytes, kept so a shot's last frame can join the
     /// eight even when the reservoir's spacing passed over it.
+    #[cfg(not(feature = "gpu"))]
     newest: Vec<u8>,
+    /// The newest frame's tensor where the reservoir passed over it, kept so
+    /// a shot's last frame can join the eight: by the time a cut says which
+    /// frame was the last, that frame's tick has gone.
+    #[cfg(feature = "gpu")]
+    newest: Option<gpu::Tensor>,
+    /// How the host makes a frame into a tensor.
+    #[cfg(feature = "gpu")]
+    maker: gpu::Maker,
+    /// Where `v` is held, settled at init.
+    #[cfg(feature = "gpu")]
+    memory: gpu::Memory,
     segment: Option<Segment>,
     model: Model,
 }
 
 impl Clips {
-    /// One clip through the tower: eight frames in, one unit vector out.
-    fn run(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+    /// One clip through the tower: the eight frames `picks` names of those
+    /// kept in, one unit vector out.
+    #[cfg(not(feature = "gpu"))]
+    fn run(&self, kept: &[Picture], picks: &[usize; FRAMES]) -> Result<Vec<f32>, String> {
+        let mut input = Vec::with_capacity(FRAMES * TENSOR);
+        for &at in picks {
+            input.extend_from_slice(&kept[at]);
+        }
+        debug_assert_eq!(input.len(), FRAMES * TENSOR);
         let dims = [1, FRAMES as u32, 3, SIDE as u32, SIDE as u32];
-        let bytes = le_bytes(input);
+        let bytes = le_bytes(&input);
         let outputs = self.model.run(&[Feed {
             name: INPUT_NAME,
             dimensions: &dims,
@@ -205,31 +259,54 @@ impl Clips {
         Ok(normalize(take(outputs)?))
     }
 
+    /// One clip through the tower: the eight frames `picks` names of those
+    /// kept, joined by the host, in; one unit vector out.
+    #[cfg(feature = "gpu")]
+    fn run(&self, kept: &[Picture], picks: &[usize; FRAMES]) -> Result<Vec<f32>, String> {
+        let input = gpu::clip(kept, picks)?;
+        let outputs = self.model.run_tensor(INPUT_NAME, input)?;
+        Ok(normalize(take(outputs)?))
+    }
+
+    /// The shot's last frame, where the reservoir passed over it.
+    #[cfg(not(feature = "gpu"))]
+    fn last(&mut self) -> Result<Picture, String> {
+        tensor_of(
+            self.arrives,
+            &self.newest,
+            &mut self.rgba,
+            self.width,
+            self.height,
+        )
+    }
+
+    /// The shot's last frame, where the reservoir passed over it.
+    #[cfg(feature = "gpu")]
+    fn last(&mut self) -> Result<Picture, String> {
+        self.newest
+            .take()
+            .ok_or_else(|| "clips: the shot's last frame was not kept".to_string())
+    }
+
     /// The row a finished stretch leaves behind, the tower run once for it.
     fn close(&mut self, mut segment: Segment) -> Result<Row, String> {
         let last = if segment.frames.holds_last() {
             None
         } else {
-            Some(tensor_of(
-                self.arrives,
-                &self.newest,
-                &mut self.rgba,
-                self.width,
-                self.height,
-            )?)
+            Some(self.last()?)
         };
-        let input = segment.frames.close(last);
-        debug_assert_eq!(input.len(), FRAMES * TENSOR);
+        let (kept, picks) = segment.frames.close(last);
         Ok(Row {
             start_t: segment.start_pts as f64 * self.tick,
             end_t: segment.last_pts as f64 * self.tick,
-            vector: self.run(&input)?,
+            vector: self.run(&kept, &picks)?,
         })
     }
 
-    /// One frame: the row a new shot or the cap ends, and the frame joining
-    /// whatever stretch it belongs to.
-    fn step(&mut self, pts: i64, shot: Option<i64>, frame: &[u8]) -> Result<Option<Row>, String> {
+    /// One frame's time and shot: the row a new shot or the cap ends, and the
+    /// stretch the frame belongs to begun or carried on. The frame itself
+    /// joins it with `keep`.
+    fn advance(&mut self, pts: i64, shot: Option<i64>) -> Result<Option<Row>, String> {
         let cut = is_new_shot(self.current_shot, shot);
         if let Some(shot) = shot {
             self.current_shot = Some(shot);
@@ -243,15 +320,39 @@ impl Clips {
 
         let segment = self.segment.get_or_insert_with(|| Segment::new(pts));
         segment.last_pts = pts;
+        Ok(row)
+    }
+
+    /// The frame's bytes offered to the running stretch, and kept as the
+    /// newest.
+    #[cfg(not(feature = "gpu"))]
+    fn keep(&mut self, frame: &[u8]) -> Result<(), String> {
         let (arrives, width, height) = (self.arrives, self.width, self.height);
         let scratch = &mut self.rgba;
+        let segment = self.segment.as_mut().expect("a stretch is running");
         segment
             .frames
             .offer(|| tensor_of(arrives, frame, scratch, width, height))?;
 
         self.newest.clear();
         self.newest.extend_from_slice(frame);
-        Ok(row)
+        Ok(())
+    }
+
+    /// Frame `index` of `v` offered to the running stretch, the host making
+    /// it into a tensor where the reservoir keeps it, or where it does not,
+    /// kept as the newest.
+    #[cfg(feature = "gpu")]
+    fn keep(&mut self, index: u32) -> Result<(), String> {
+        let maker = &self.maker;
+        let segment = self.segment.as_mut().expect("a stretch is running");
+        segment.frames.offer(|| maker.tensor(index))?;
+        self.newest = if segment.frames.holds_last() {
+            None
+        } else {
+            Some(maker.tensor(index)?)
+        };
+        Ok(())
     }
 }
 
@@ -260,17 +361,31 @@ fn emit(out: &mut Out, row: &Row) -> Result<(), String> {
     out.row("shots", pts, row)
 }
 
+/// The formats `v` takes: yuv420p, converted here, or rgba.
+#[cfg(not(feature = "gpu"))]
+fn pixel_formats(_: &NoParams) -> &'static [&'static str] {
+    &["yuv420p", "rgba"]
+}
+
+#[cfg(feature = "gpu")]
+use gpu::pixel_formats;
+
 impl Node for Clips {
     const NAME: &'static str = "clips";
     const VERSION: &'static str = "0.2.0";
+    #[cfg(not(feature = "gpu"))]
     type Params = NoParams;
+    #[cfg(feature = "gpu")]
+    const PARAMS_SCHEMA: &'static str = PARAMS_SCHEMA;
+    #[cfg(feature = "gpu")]
+    type Params = gpu::Settings;
 
-    fn shape(_: &NoParams, bound: &Bound) -> Result<Shape> {
+    fn shape(params: &Self::Params, bound: &Bound) -> Result<Shape> {
         Ok(Shape::new()
             .input(
                 Input::video("v")
                     .clock()
-                    .pixel_formats(&["yuv420p", "rgba"]),
+                    .pixel_formats(pixel_formats(params)),
             )
             .input(Input::rows("cuts").optional().lockstep().schema::<Cut>())
             .output(
@@ -281,6 +396,7 @@ impl Node for Clips {
             ))
     }
 
+    #[cfg(not(feature = "gpu"))]
     fn init(_: NoParams, init: &Init) -> Result<Clips> {
         let v = init.stream("v")?;
         let video = v
@@ -310,16 +426,50 @@ impl Node for Clips {
         })
     }
 
+    #[cfg(feature = "gpu")]
+    fn init(settings: gpu::Settings, init: &Init) -> Result<Clips> {
+        let v = init.stream("v")?;
+        let video = v
+            .video_format()
+            .ok_or("clips reads pictures, and `v` is not video")?;
+        Ok(Clips {
+            v: v.id,
+            cuts: init.optional("cuts").map(|cuts| cuts.id),
+            tick: seconds_per_tick(v.info.time_base),
+            current_shot: None,
+            newest: None,
+            maker: gpu::Maker::new(v.id, video.width, video.height, MODEL),
+            memory: settings.memory,
+            segment: None,
+            model: Model::load("clips", MODEL)?,
+        })
+    }
+
+    #[cfg(feature = "gpu")]
+    fn set_params(&mut self, settings: gpu::Settings) -> Result<()> {
+        // Where `v` is held is the shape's, settled at init.
+        if settings.memory != self.memory {
+            return Err("clips cannot move `v` between host and gpu memory while it runs".into());
+        }
+        Ok(())
+    }
+
     fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
         let shot = match self.cuts {
             Some(cuts) => tick.rows::<Cut>(cuts)?.last().map(|cut| cut.shot),
             None => None,
         };
         for frame in tick.frames(self.v) {
-            let bytes = tick.fetch(self.v, frame.index);
-            if let Some(row) = self.step(frame.pts, shot, &bytes)? {
+            let row = self.advance(frame.pts, shot)?;
+            if let Some(row) = row {
                 emit(out, &row)?;
             }
+            // The host makes the frame into a tensor wherever it is held, so
+            // the frame is never fetched here.
+            #[cfg(feature = "gpu")]
+            self.keep(frame.index)?;
+            #[cfg(not(feature = "gpu"))]
+            self.keep(&tick.fetch(self.v, frame.index))?;
         }
         if tick.last() {
             if let Some(segment) = self.segment.take() {
@@ -367,7 +517,10 @@ mod tests {
             Runner::<Clips>::shape("", &bound).expect("a shape").outputs[0].latency
         };
         assert_eq!(at(Some(Rational::new(25, 1))), 10.04);
-        assert_eq!(at(Some(Rational::new(30000, 1001))), 10.0 + 1001.0 / 30000.0);
+        assert_eq!(
+            at(Some(Rational::new(30000, 1001))),
+            10.0 + 1001.0 / 30000.0
+        );
         assert_eq!(at(Some(Rational::new(2, 1))), 10.5);
         assert_eq!(at(None), 10.5, "half a second where the rate is unknown");
     }
@@ -385,6 +538,7 @@ mod tests {
         assert!((seconds_per_tick(Rational::new(1001, 30000)) * 30000.0 - 1001.0).abs() < 1e-9);
     }
 
+    #[cfg(not(feature = "gpu"))]
     #[test]
     fn a_tv_range_picture_reaches_the_tower_at_full_contrast() {
         let tv = Arrives::Yuv420p(
