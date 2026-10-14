@@ -1,16 +1,16 @@
 {
   "name": "ffrwd/describe",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Four AI describers over a file that generate embedding vectors suitable for a cosine similarity search.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-describe",
+  "ffrwd": ">=0.30.0",
   "capabilities": [
-    "nn",
-    "gpu"
+    "nn"
   ],
   "dependencies": {
     "ffrwd/index": "0.2.1",
-    "ffrwd/shots": "0.2.1",
+    "ffrwd/shots": "0.3.0",
     "ffrwd/vad": "0.2.1",
     "ffrwd/wasm": "0.19.1",
     "ffrwd/whisper": "0.3.1"

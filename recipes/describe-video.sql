@@ -33,6 +33,6 @@ COPY (
                         "model_hash":"87a87b51ae52efa549e6e48f3a3b41f4",
                         "query":"hf:imbcmdth/xclip-onnx@649f3c91b59cd24be316dc505e26eacf5cd00801/text_tower.onnx",
                         "query_hash":"c14df0fdda1ba530330e278b8fabeb0b",
-                        "producer":"ffrwd/describe 0.3.1"}]')
+                        "producer":"ffrwd/describe 0.4.0"}]')
   FROM input(:'src') f
 ) TO :'dest'

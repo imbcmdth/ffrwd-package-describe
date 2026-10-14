@@ -10,7 +10,7 @@ not this package's job - it composes
 and [`ffrwd/vad`](https://github.com/imbcmdth/ffrwd-package-vad)
 instead of shipping a third model for it.
 
-Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
+Requires ffrwd 0.30, whose `ffrwd/wasm` is 0.19.1.
 
 The four modules are built and run:
 `target/wasm32-wasip2/release/{clips,sounds,embed,embed_clip}.wasm`, all
@@ -36,7 +36,8 @@ built beside `ffrwd:gpu`. `ffrwd install` is the whole of the setup.
   vector agrees with `clips`' to a cosine of 0.994 to 0.9999 on a five-shot
   test clip at 1080p and 4K, and ranks shots the same way. `cuts` comes from
   `ffrwd.shots.simple_detector_gpu(v)` over the same picture. It imports
-  `ffrwd:gpu`, so it runs where the sidecar has GPU support.
+  `ffrwd:gpu`, so it runs where the sidecar has GPU support, and needs
+  ffrwd 0.30.
 - `sounds(a, threshold DEFAULT 0.3, top DEFAULT 3)` returns `cue[]`: up
   to `top` AudioSet labels a ten-second window, windows half a window
   apart, each leaving with its window. No sound leaves.
